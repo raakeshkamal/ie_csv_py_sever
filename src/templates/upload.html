@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload Trading CSV Files</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+
+        form {
+            border: 1px solid #ddd;
+            padding: 20px;
+            border-radius: 8px;
+        }
+
+        input[type="file"] {
+            margin-bottom: 10px;
+        }
+
+        input[type="submit"] {
+            background: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        input[type="submit"]:hover {
+            background: #0056b3;
+        }
+
+        h1 {
+            color: #333;
+        }
+
+        #result {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+
+        .browse-button {
+            background: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            display: inline-block;
+            font-size: 14px;
+        }
+
+        .browse-button:hover {
+            background: #0056b3;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Upload Batch of Trading CSV Files</h1>
+    <p>Select multiple CSV files (e.g., GIA and ISA trading statements) to merge into a single file.</p>
+    <form hx-post="/upload/" hx-swap="none" hx-on::after-request="handleResponse(event)" enctype="multipart/form-data">
+        <label>Choose CSV files:</label><br>
+        <input type="file" id="files" name="files" multiple accept=".csv" required style="display: none;" onchange="if(this.files.length > 0) { console.log('Files selected, submitting form'); htmx.trigger(this.form, 'submit'); }"><br>
+        <label for="files" class="browse-button">Browse Files</label><br>
+    </form>
+    <div id="result"></div>
+    <script>
+        function handleResponse(event) {
+            const target = document.getElementById('result');
+            const xhr = event.detail.xhr;
+            const responseText = xhr.responseText;
+
+            try {
+                const response = JSON.parse(responseText);
+                if (response.success) {
+                    let html = `
+                        <div class="success">
+                            <h2>Files merged successfully!</h2>
+                            <p>Total transactions: ${response.total_transactions}</p>
+                            <p>Date range: ${response.min_date} to ${response.max_date}</p>
+                            <div id="hist-chart"></div>
+                            <div id="line-chart"></div>
+                            <br><br>
+                            <button class="browse-button" onclick="resetForm()">Upload another batch</button>
+                        </div>
+                    `;
+                    target.innerHTML = html;
+
+                    // Render charts if data available
+                    if (response.monthly_net && response.monthly_net.length > 0) {
+                        const months = response.monthly_net.map(m => m.Month);
+                        const net_values = response.monthly_net.map(m => m.Net_Value);
+                        const cumulative = response.cumulative || [];
+
+                        // Bar chart
+                        Plotly.newPlot('hist-chart', [{
+                            x: months,
+                            y: net_values,
+                            type: 'bar',
+                            name: 'Monthly Net Contributions'
+                        }], {
+                            title: 'Monthly Net Contributions (Buy positive, Sell negative)',
+                            xaxis: { title: 'Month' },
+                            yaxis: { title: 'Net Value' }
+                        });
+
+                        // Line chart
+                        Plotly.newPlot('line-chart', [{
+                            x: months,
+                            y: cumulative,
+                            type: 'line',
+                            name: 'Cumulative Value'
+                        }], {
+                            title: 'Cumulative Portfolio Value Over Time',
+                            xaxis: { title: 'Month' },
+                            yaxis: { title: 'Cumulative Value' }
+                        });
+                    } else {
+                        target.innerHTML += '<p>Chart data unavailable.</p>';
+                    }
+                } else {
+                    target.innerHTML = `<div class="error"><h2>Error: ${response.error}</h2><p><a href="/">Try again</a></p></div>`;
+                }
+            } catch (e) {
+                console.error('Error handling response:', e);
+                target.innerHTML = '<div class="error"><h2>Unexpected error occurred</h2><p><a href="/">Try again</a></p></div>';
+            }
+        }
+
+        function resetForm() {
+            document.getElementById('files').value = '';
+            document.getElementById('result').innerHTML = '';
+        }
+    </script>
+</body>
+
+</html>
