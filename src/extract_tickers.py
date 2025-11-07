@@ -102,7 +102,7 @@ def search_ticker_for_isin(security_name: str, isin: str) -> Optional[str]:
 
 def main():
     # Read the merged SQLite database
-    db_path = "merged_trading.db"
+    db_path = "db/merged_trading.db"
     conn = sqlite3.connect(db_path)
     df = pd.read_sql_query("SELECT * FROM trades", conn)
     conn.close()

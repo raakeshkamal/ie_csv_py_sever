@@ -79,14 +79,20 @@
 <body>
     <h1>Upload Batch of Trading CSV Files</h1>
     <p>Select multiple CSV files (e.g., GIA and ISA trading statements) to merge into a single file.</p>
-    <form hx-post="/upload/" hx-swap="none" hx-on::after-request="handleResponse(event)" enctype="multipart/form-data">
+    <form hx-post="/upload/" hx-swap="none" hx-on::after-request="handleUploadResponse(event)"
+        enctype="multipart/form-data">
         <label>Choose CSV files:</label><br>
-        <input type="file" id="files" name="files" multiple accept=".csv" required style="display: none;" onchange="if(this.files.length > 0) { console.log('Files selected, submitting form'); htmx.trigger(this.form, 'submit'); }"><br>
+        <input type="file" id="files" name="files" multiple accept=".csv" required style="display: none;"
+            onchange="if(this.files.length > 0) { console.log('Files selected, submitting form'); htmx.trigger(this.form, 'submit'); }"><br>
         <label for="files" class="browse-button">Browse Files</label><br>
     </form>
     <div id="result"></div>
+    <div id="charts-container" style="display: none;">
+        <div id="hist-chart"></div>
+        <div id="line-chart"></div>
+    </div>
     <script>
-        function handleResponse(event) {
+        function handleUploadResponse(event) {
             const target = document.getElementById('result');
             const xhr = event.detail.xhr;
             const responseText = xhr.responseText;
@@ -99,21 +105,38 @@
                             <h2>Files merged successfully!</h2>
                             <p>Total transactions: ${response.total_transactions}</p>
                             <p>Date range: ${response.min_date} to ${response.max_date}</p>
-                            <div id="hist-chart"></div>
-                            <div id="line-chart"></div>
+                            <br>
+                            <button id="generate-charts" class="browse-button" onclick="console.log('Generate Charts button clicked');" hx-get="/portfolio-values/" hx-target="#charts-container" hx-swap="none" hx-on::after-request="handlePortfolioResponse(event)">Generate Charts</button>
                             <br><br>
                             <button class="browse-button" onclick="resetForm()">Upload another batch</button>
                         </div>
                     `;
                     target.innerHTML = html;
+                    htmx.process(target);
+                    document.getElementById('charts-container').style.display = 'none';
+                } else {
+                    target.innerHTML = `<div class="error"><h2>Error: ${response.error}</h2><p><a href="/">Try again</a></p></div>`;
+                }
+            } catch (e) {
+                console.error('Error handling upload response:', e);
+                target.innerHTML = '<div class="error"><h2>Unexpected error occurred</h2><p><a href="/">Try again</a></p></div>';
+            }
+        }
 
-                    // Render charts if data available
+        function handlePortfolioResponse(event) {
+            console.log('Portfolio response received');
+            const target = document.getElementById('charts-container');
+            const xhr = event.detail.xhr;
+            const responseText = xhr.responseText;
+
+            try {
+                const response = JSON.parse(responseText);
+                if (response.success) {
                     if (response.monthly_net && response.monthly_net.length > 0) {
                         const months = response.monthly_net.map(m => m.Month);
                         const net_values = response.monthly_net.map(m => m.Net_Value);
-                        const cumulative = response.cumulative || [];
 
-                        // Bar chart
+                        // Bar chart for monthly net
                         Plotly.newPlot('hist-chart', [{
                             x: months,
                             y: net_values,
@@ -125,32 +148,40 @@
                             yaxis: { title: 'Net Value' }
                         });
 
-                        // Line chart
-                        Plotly.newPlot('line-chart', [{
-                            x: months,
-                            y: cumulative,
-                            type: 'line',
-                            name: 'Cumulative Value'
-                        }], {
-                            title: 'Cumulative Portfolio Value Over Time',
-                            xaxis: { title: 'Month' },
-                            yaxis: { title: 'Cumulative Value' }
-                        });
+                        // Line chart for daily portfolio value
+                        if (response.daily_dates && response.daily_values && response.daily_dates.length > 0) {
+                            Plotly.newPlot('line-chart', [{
+                                x: response.daily_dates,
+                                y: response.daily_values,
+                                type: 'line',
+                                name: 'Actual Portfolio Value'
+                            }], {
+                                title: 'Actual Portfolio Value Over Time (Including Price Changes)',
+                                xaxis: { title: 'Date' },
+                                yaxis: { title: 'Portfolio Value' }
+                            });
+                        }
                     } else {
-                        target.innerHTML += '<p>Chart data unavailable.</p>';
+                        target.innerHTML = '<p>Chart data unavailable.</p>';
                     }
+                    target.style.display = 'block';
                 } else {
-                    target.innerHTML = `<div class="error"><h2>Error: ${response.error}</h2><p><a href="/">Try again</a></p></div>`;
+                    target.innerHTML = `<div class="error"><h2>Error generating charts: ${response.error}</h2></div>`;
+                    target.style.display = 'block';
                 }
             } catch (e) {
-                console.error('Error handling response:', e);
-                target.innerHTML = '<div class="error"><h2>Unexpected error occurred</h2><p><a href="/">Try again</a></p></div>';
+                console.error('Error handling portfolio response:', e);
+                target.innerHTML = '<div class="error"><h2>Unexpected error generating charts</h2></div>';
+                target.style.display = 'block';
             }
+            console.log('Charts generation completed');
         }
 
         function resetForm() {
             document.getElementById('files').value = '';
             document.getElementById('result').innerHTML = '';
+            document.getElementById('charts-container').style.display = 'none';
+            document.getElementById('charts-container').innerHTML = '<div id="hist-chart"></div><div id="line-chart"></div>';
         }
     </script>
 </body>

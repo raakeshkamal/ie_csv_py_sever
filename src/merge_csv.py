@@ -1,8 +1,8 @@
-import pandas as pd
 import io
-import re
-from typing import List, Tuple
 from datetime import datetime
+from typing import List, Tuple
+
+import pandas as pd
 
 
 def extract_account_type(filename: str) -> str:
