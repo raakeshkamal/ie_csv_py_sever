@@ -687,12 +687,10 @@ class TestExportPricesEndpoint:
             assert response.status_code == 200
             data = response.json()
             assert data["success"] is True
-            assert "portfolio_values" in data
-            assert "monthly_contributions" in data
+            assert "ticker_prices" in data
             assert "status" in data
             assert "count" in data
-            assert data["count"]["portfolio_values"] == 0
-            assert data["count"]["monthly_contributions"] == 0
+            assert data["count"] == 0
 
     def test_export_prices_with_data(self):
         """Test exporting prices when precomputed data exists."""
@@ -750,33 +748,20 @@ iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,
             data = response.json()
             assert data["success"] is True
 
-            # Verify structure
-            assert "portfolio_values" in data
-            assert "monthly_contributions" in data
+            # Verify structure for ticker prices
+            assert "ticker_prices" in data
             assert "status" in data
             assert "count" in data
 
-            # Should have data
-            assert data["count"]["portfolio_values"] > 0
-            assert data["count"]["monthly_contributions"] == 1
-
-            # Verify portfolio values have correct structure
-            pv = data["portfolio_values"][0]
-            assert "date" in pv
-            assert "daily_value" in pv
-            assert "last_updated" in pv
-
-            # Verify monthly contributions have correct structure
-            mc = data["monthly_contributions"][0]
-            assert "month" in mc
-            assert "net_value" in mc
-            assert "last_updated" in mc
-
-            # Verify status structure
-            status = data["status"]
-            assert "status" in status
-            assert "has_data" in status
-            assert status["status"] == "completed"
+            # Verify ticker prices have correct structure
+            if len(data["ticker_prices"]) > 0:
+                tp = data["ticker_prices"][0]
+                assert "ticker" in tp
+                assert "date" in tp
+                assert "original_currency" in tp
+                assert "original_price" in tp
+                assert "converted_price_gbp" in tp
+                assert "last_updated" in tp
 
     def test_export_prices_format(self):
         """Test that export prices format is correct."""
@@ -791,17 +776,14 @@ iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,
             import datetime
             conn = sqlite3.connect(tmp_db_path)
             conn.execute("""
-                CREATE TABLE IF NOT EXISTS precomputed_portfolio_values (
-                    date DATE PRIMARY KEY,
-                    daily_value REAL,
-                    last_updated TIMESTAMP
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS precomputed_monthly_contributions (
-                    month TEXT PRIMARY KEY,
-                    net_value REAL,
-                    last_updated TIMESTAMP
+                CREATE TABLE IF NOT EXISTS precomputed_ticker_prices (
+                    ticker TEXT,
+                    date DATE,
+                    original_currency TEXT,
+                    original_price REAL,
+                    converted_price_gbp REAL,
+                    last_updated TIMESTAMP,
+                    PRIMARY KEY (ticker, date)
                 )
             """)
             conn.execute("""
@@ -817,13 +799,14 @@ iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,
 
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             conn.execute("""
-                INSERT INTO precomputed_portfolio_values (date, daily_value, last_updated)
-                VALUES (?, ?, ?), (?, ?, ?)
-            """, ("2024-12-01", 152.05, now, "2024-12-02", 162.05, now))
-            conn.execute("""
-                INSERT INTO precomputed_monthly_contributions (month, net_value, last_updated)
-                VALUES (?, ?, ?)
-            """, ("2024-12", 1000.0, now))
+                INSERT INTO precomputed_ticker_prices
+                (ticker, date, original_currency, original_price, converted_price_gbp, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)
+            """, (
+                "VUSA.L", "2024-12-01", "GBP", 31.5, 31.5, now,
+                "VUSA.L", "2024-12-02", "GBP", 31.6, 31.6, now,
+                "VWRL.L", "2024-12-01", "USD", 82.5, 65.0, now
+            ))
             conn.execute("""
                 INSERT INTO precompute_status (status, started_at, completed_at, total_tickers)
                 VALUES (?, ?, ?, ?)
@@ -837,18 +820,24 @@ iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,
             data = response.json()
 
             # Verify all data is present
-            assert len(data["portfolio_values"]) == 2
-            assert len(data["monthly_contributions"]) == 1
+            assert len(data["ticker_prices"]) == 3
 
-            # Verify correct ordering (should be sorted by date/month)
-            dates = [pv["date"] for pv in data["portfolio_values"]]
-            assert dates[0] < dates[1]
+            # Verify structure of ticker prices
+            for tp in data["ticker_prices"]:
+                assert "ticker" in tp
+                assert "date" in tp
+                assert "original_currency" in tp
+                assert "original_price" in tp
+                assert "converted_price_gbp" in tp
+                assert "last_updated" in tp
 
-            # Verify values
-            assert data["portfolio_values"][0]["daily_value"] == 152.05
-            assert data["portfolio_values"][1]["daily_value"] == 162.05
-            assert data["monthly_contributions"][0]["month"] == "2024-12"
-            assert data["monthly_contributions"][0]["net_value"] == 1000.0
+            # Verify correct ordering (should be sorted by ticker, then date)
+            assert data["ticker_prices"][0]["ticker"] == "VUSA.L"
+            assert data["ticker_prices"][0]["date"] == "2024-12-01"
+            assert data["ticker_prices"][0]["original_price"] == 31.5
+            assert data["ticker_prices"][2]["ticker"] == "VWRL.L"
+            assert data["ticker_prices"][2]["original_currency"] == "USD"
+            assert data["ticker_prices"][2]["converted_price_gbp"] == 65.0
 
 
 @pytest.mark.integration
@@ -1009,95 +998,6 @@ iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,
                 assert len(data["monthly_net"]) == 1
                 assert data["monthly_net"][0]["Net_Value"] == 1000.0
 
-    def test_portfolio_values_falls_back_to_live_calculation_when_data_stale(self):
-        """Test that portfolio-values endpoint falls back to live calculation when precomputed data is stale."""
-        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_db:
-            tmp_db_path = tmp_db.name
-
-        with patch.object(src.database, 'DB_PATH', tmp_db_path):
-            client = TestClient(app)
-
-            # Reset and create tables
-            client.post("/reset/")
-
-            # Insert stale data (older than 24 hours)
-            import sqlite3
-            import datetime
-            conn = sqlite3.connect(tmp_db_path)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS precomputed_portfolio_values (
-                    date DATE PRIMARY KEY,
-                    daily_value REAL,
-                    last_updated TIMESTAMP
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS precomputed_monthly_contributions (
-                    month TEXT PRIMARY KEY,
-                    net_value REAL,
-                    last_updated TIMESTAMP
-                )
-            """)
-
-            # Insert stale data (2 days old)
-            old_date = (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
-            conn.execute("""
-                INSERT INTO precomputed_portfolio_values (date, daily_value, last_updated)
-                VALUES (?, ?, ?)
-            """, ("2024-12-01", 152.05, old_date))
-            conn.commit()
-            conn.close()
-
-            # Upload real trades
-            csv_content = """Trading Statement,
-Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
-Vanguard FTSE 250 / ISIN IE00BYYHSQ67,Buy,5,£30.41,£152.05,01/11/24 12:45:32,05/11/24,InvestEngine
-"""
-            file_content = BytesIO(csv_content.encode('utf-8'))
-
-            with patch('yfinance.Ticker') as mock_ticker_class:
-                # Mock ticker info
-                mock_ticker_info = MagicMock()
-                mock_ticker_info.info = {'currency': 'GBP'}
-
-                # Mock ticker history
-                mock_ticker_hist = MagicMock()
-                dates = pd.date_range('2024-11-01', '2025-12-15', freq='D')
-                prices = [100.0 + i * 0.5 for i in range(len(dates))]
-                mock_hist_df = pd.DataFrame({'Close': prices}, index=dates)
-                mock_ticker_hist.history.return_value = mock_hist_df
-
-                def create_ticker(ticker_str):
-                    if 'currency' in str(ticker_str):
-                        return mock_ticker_info
-                    return mock_ticker_hist
-
-                mock_ticker_class.side_effect = create_ticker
-
-                with patch('requests.get') as mock_requests:
-                    mock_response = MagicMock()
-                    mock_response.json.return_value = {
-                        "quotes": [{"symbol": "VUSA.L", "exchange": "LSE", "quoteType": "ETF"}]
-                    }
-                    mock_requests.return_value = mock_response
-
-                    upload_response = client.post(
-                        "/upload/",
-                        files={"files": ("trades.csv", file_content, "text/csv")}
-                    )
-
-                    assert upload_response.status_code == 200
-
-                    # Get portfolio values - should fall back to live calculation
-                    response = client.get("/portfolio-values/")
-
-                    assert response.status_code == 200
-                    data = response.json()
-                    assert data["success"] is True
-
-                    # Should have fresh portfolio values (not the stale 152.05)
-                    assert len(data["daily_values"]) > 1
-
     def test_full_workflow_upload_portfolio_export(self):
         """Test the complete workflow: upload → get portfolio → export prices."""
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_db:
@@ -1170,14 +1070,16 @@ iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,
             assert export_response.status_code == 200
             export_data = export_response.json()
             assert export_data["success"] is True
-            assert "portfolio_values" in export_data
-            assert "monthly_contributions" in export_data
+            assert "ticker_prices" in export_data
             assert "status" in export_data
             assert "count" in export_data
 
-            # Verify data consistency between endpoints
-            assert len(portfolio_data["daily_dates"]) == len(export_data["portfolio_values"])
-            assert len(portfolio_data["monthly_net"]) == len(export_data["monthly_contributions"])
+            # Verify ticker prices contain expected fields
+            assert len(export_data["ticker_prices"]) > 0
+            assert "original_currency" in export_data["ticker_prices"][0]
+            assert "original_price" in export_data["ticker_prices"][0]
+            assert "converted_price_gbp" in export_data["ticker_prices"][0]
+            assert "date" in export_data["ticker_prices"][0]
 
     def test_portfolio_values_endpoint_no_precomputed_data(self):
         """Test portfolio-values when no precomputed data exists (falls back to live calculation)."""

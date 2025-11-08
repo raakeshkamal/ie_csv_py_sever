@@ -241,10 +241,10 @@ async def get_portfolio_values():
 
 
 @app.get("/export/prices/")
-async def export_precomputed_portfolio_data():
+async def export_ticker_prices():
     """
-    Export all precomputed portfolio data including daily values, monthly contributions, and metadata.
-    Returns the entire precomputed dataset in JSON format containing prices and related calculations.
+    Export daily ticker prices for each ticker in both yfinance currency and target currency (GBP).
+    Returns ticker prices data in JSON format.
     """
     try:
         data = export_precomputed_data()
@@ -255,10 +255,16 @@ async def export_precomputed_portfolio_data():
                 status_code=500
             )
 
-        return JSONResponse(content={"success": True, **data})
+        # Return only ticker prices data
+        return JSONResponse(content={
+            "success": True,
+            "ticker_prices": data.get("ticker_prices", []),
+            "count": data.get("count", {}).get("ticker_prices", 0),
+            "status": data.get("status", {})
+        })
 
     except Exception as e:
-        logger.error(f"Error exporting precomputed portfolio data: {e}")
+        logger.error(f"Error exporting ticker prices: {e}")
         import traceback
         traceback.print_exc()
         return JSONResponse(

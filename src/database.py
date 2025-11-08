@@ -38,6 +38,7 @@ def reset_database(db_path: Optional[str] = None):
         conn.execute("DROP TABLE IF EXISTS prices")
         conn.execute("DROP TABLE IF EXISTS precomputed_portfolio_values")
         conn.execute("DROP TABLE IF EXISTS precomputed_monthly_contributions")
+        conn.execute("DROP TABLE IF EXISTS precomputed_ticker_prices")
         conn.execute("DROP TABLE IF EXISTS precompute_status")
         conn.commit()
     finally:
