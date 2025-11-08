@@ -241,19 +241,19 @@ async def get_portfolio_values():
             )
 
         # Fetch currencies for all tickers
-        currencies = {}
-        has_usd = False
+        reported_currencies = {}
+        needed_fx = set()
         for ticker in unique_tickers:
             try:
                 yf_ticker = yf.Ticker(ticker)
-                currency = yf_ticker.info.get("currency", "Unknown")
-                currencies[ticker] = currency
-                if currency == "USD":
-                    has_usd = True
-                print(f"Ticker {ticker}: Currency = {currency}")
+                reported = yf_ticker.info.get("currency", "Unknown")
+                reported_currencies[ticker] = reported
+                if reported != "Unknown" and reported != "GBP" and reported != "GBp":
+                    needed_fx.add(reported)
+                print(f"Ticker {ticker}: Reported={reported}")
             except Exception as e:
                 print(f"Error getting currency for {ticker}: {e}")
-                currencies[ticker] = "GBP"  # Assume GBP fallback
+                reported_currencies[ticker] = "GBP"
 
         # Log yfinance currencies for tickers
         print("=== DEBUG: yfinance Currencies ===")
@@ -330,6 +330,7 @@ async def get_portfolio_values():
 
         # Create prices table if not exists (now for converted GBP prices)
         conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE IF EXISTS prices")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS prices (
                 ticker TEXT,
@@ -340,36 +341,45 @@ async def get_portfolio_values():
         """)
         conn.commit()
 
-        # Fetch FX rates if needed (GBPUSD=X: USD per GBP, so to convert USD to GBP: usd_price / rate)
-        fx_rates = None
-        if has_usd:
-            print("Fetching USD/GBP historical rates")
-            try:
-                fx_ticker = yf.Ticker("GBPUSD=X")
-                fx_hist = fx_ticker.history(
-                    start=common_start, end=max_date + pd.Timedelta(days=1)
-                )
-                if not fx_hist.empty:
-                    try:
-                        if fx_hist.index.tz is not None:
-                            fx_hist.index = fx_hist.index.tz_localize(None)
-                    except (AttributeError, TypeError):
-                        pass
-                    fx_close = (
-                        fx_hist["Close"].reindex(dates).ffill().fillna(1.0)
-                    )  # Default 1 if no rate
-                    fx_rates = fx_close.values
-                    print(
-                        f"FX rates fetched: {len(fx_rates)} days, sample: {fx_rates[:3]}"
+        # Fetch FX rates for non-GBP currencies
+        fx_config = {
+            "USD": ("GBPUSD=X", False),  # divide by rate (USD/GBP)
+            "EUR": ("EURGBP=X", True),   # multiply by rate (GBP/EUR)
+            # Add more currencies as needed
+        }
+        fx_data = {}
+        for curr in needed_fx:
+            if curr in fx_config:
+                fx_ticker_str, multiply = fx_config[curr]
+                try:
+                    print(f"Fetching FX for {curr}: {fx_ticker_str}")
+                    fx_ticker = yf.Ticker(fx_ticker_str)
+                    fx_hist = fx_ticker.history(
+                        start=common_start, end=max_date + pd.Timedelta(days=1)
                     )
-                else:
-                    print("No FX data, assuming 1 USD = 1 GBP")
-                    fx_rates = np.ones(len(dates))
-            except Exception as e:
-                print(f"Error fetching FX rates: {e}, assuming 1:1")
-                fx_rates = np.ones(len(dates))
-        else:
-            fx_rates = np.ones(len(dates))  # No conversion needed
+                    if not fx_hist.empty:
+                        try:
+                            if fx_hist.index.tz is not None:
+                                fx_hist.index = fx_hist.index.tz_localize(None)
+                        except (AttributeError, TypeError):
+                            pass
+                        fx_close = (
+                            fx_hist["Close"].reindex(dates).ffill().fillna(1.0)
+                        )
+                        fx_data[curr] = {"rates": fx_close.values, "multiply": multiply}
+                        print(
+                            f"FX rates for {curr} fetched: {len(fx_close)} days, sample: {fx_close.values[:3]}"
+                        )
+                    else:
+                        print(f"No FX data for {curr}, assuming 1:1")
+                        fx_data[curr] = {"rates": np.ones(len(dates)), "multiply": multiply}
+                except Exception as e:
+                    print(f"Error fetching FX for {curr}: {e}, assuming 1:1")
+                    fx_data[curr] = {"rates": np.ones(len(dates)), "multiply": multiply}
+            else:
+                print(f"Unsupported currency {curr}, assuming prices in GBP")
+        if not needed_fx:
+            print("All currencies are GBP or GBp, no FX needed")
 
         print(
             f"DEBUG HOLDINGS: common_start = {common_start}, max_date = {max_date}, num_days = {len(dates)}"
@@ -407,12 +417,16 @@ async def get_portfolio_values():
             )
 
             # Aggregate adjustments by date (handle multiple trades per day)
-            daily_adj = ticker_trades.groupby(ticker_trades["Trade Date/Time"].dt.date)["Quantity_Adj"].sum()
+            daily_adj = ticker_trades.groupby(ticker_trades["Trade Date/Time"].dt.date)[
+                "Quantity_Adj"
+            ].sum()
             print(
                 f"DEBUG HOLDINGS [{ticker}]: Number of unique trade dates: {len(daily_adj)}, total adj: {daily_adj.sum()}"
             )
             if len(daily_adj) > 0:
-                print(f"DEBUG HOLDINGS [{ticker}]: Sample daily adj: {dict(list(daily_adj.items())[:3])}")
+                print(
+                    f"DEBUG HOLDINGS [{ticker}]: Sample daily adj: {dict(list(daily_adj.items())[:3])}"
+                )
 
             # Build daily holdings by iterating through dates and accumulating (carries forward previous holding)
             daily_holdings = pd.Series(index=dates, dtype=float)
@@ -426,13 +440,15 @@ async def get_portfolio_values():
                 cum_qty += adj_today
                 daily_holdings.iloc[i] = cum_qty
                 if abs(adj_today) > 1e-6:
-                    print(
-                        f"DEBUG HOLDINGS [{ticker}]: Updated to cum={cum_qty:.6f}"
-                    )
+                    print(f"DEBUG HOLDINGS [{ticker}]: Updated to cum={cum_qty:.6f}")
 
             # No NaNs or ffill needed; all days explicitly set with carry-forward
-            print(f"DEBUG HOLDINGS [{ticker}]: Final: NaNs={daily_holdings.isna().sum()}, min={daily_holdings.min():.6f}, max={daily_holdings.max():.6f}")
-            non_zero_count = (abs(daily_holdings) > 1e-6).sum()  # Ignore floating-point zeros
+            print(
+                f"DEBUG HOLDINGS [{ticker}]: Final: NaNs={daily_holdings.isna().sum()}, min={daily_holdings.min():.6f}, max={daily_holdings.max():.6f}"
+            )
+            non_zero_count = (
+                abs(daily_holdings) > 1e-6
+            ).sum()  # Ignore floating-point zeros
             print(
                 f"DEBUG HOLDINGS [{ticker}]: non-zero days: {non_zero_count} / {len(daily_holdings)}, max holding: {daily_holdings.max() if non_zero_count > 0 else 0}"
             )
@@ -490,19 +506,50 @@ async def get_portfolio_values():
                         # Always use Close price
                         prices = hist["Close"].reindex(dates).ffill().fillna(0.0)
 
-                        # Convert to GBP based on currency
-                        currency = currencies.get(ticker, "GBP")
+                        # Convert to GBP: for .L tickers, handle reported currency specially
+                        reported = reported_currencies.get(ticker, "GBP")
                         converted_prices = prices.copy()
-                        if currency == "GBp":
-                            converted_prices = prices / 100.0
-                            print(f"Converted {ticker} GBp to GBP (divided by 100)")
-                        elif currency == "USD":
-                            fx_series = pd.Series(fx_rates, index=dates)
-                            converted_prices = prices / fx_series.reindex(
-                                dates
-                            ).ffill().fillna(1.0)
-                            print(f"Converted {ticker} USD to GBP using FX rates")
-                        # Else: assume already GBP
+                        is_lse = ticker.endswith('.L')
+                        if is_lse:
+                            if reported == "GBp":
+                                converted_prices = prices / 100.0
+                                print(f"Converted {ticker} (LSE, GBp) to GBP (divided by 100)")
+                            elif reported == "USD":
+                                # Convert USD to GBP even for LSE
+                                fx_info = fx_data.get("USD")
+                                if fx_info:
+                                    rates_series = pd.Series(fx_info["rates"], index=dates)
+                                    converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
+                                    print(f"Converted {ticker} (LSE, reported USD) to GBP using FX rates")
+                                else:
+                                    print(f"No FX for USD on {ticker}, assuming already in GBP")
+                            else:
+                                print(f"{ticker} (LSE, {reported}) assumed in GBP, no change")
+                        else:
+                            # Non-LSE: use reported
+                            if reported == "GBp":
+                                converted_prices = prices / 100.0
+                                print(f"Converted {ticker} GBp to GBP (divided by 100)")
+                            elif reported == "USD":
+                                fx_info = fx_data.get("USD")
+                                if fx_info:
+                                    rates_series = pd.Series(fx_info["rates"], index=dates)
+                                    converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
+                                    print(f"Converted {ticker} USD to GBP using FX rates")
+                            elif reported != "GBP":
+                                # Handle other currencies if needed
+                                fx_info = fx_data.get(reported)
+                                if fx_info:
+                                    rates_series = pd.Series(fx_info["rates"], index=dates)
+                                    if fx_info["multiply"]:
+                                        converted_prices = prices * rates_series.reindex(dates).ffill().fillna(1.0)
+                                    else:
+                                        converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
+                                    print(f"Converted {ticker} {reported} to GBP using FX rates")
+                                else:
+                                    print(f"No FX info for {reported} on {ticker}, assuming already in GBP")
+                            else:
+                                print(f"{ticker} ({reported}) assumed in GBP, no change")
 
                         # Replace any remaining NaN with 0
                         converted_prices = converted_prices.fillna(0.0)
