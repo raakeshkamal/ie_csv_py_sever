@@ -12,6 +12,12 @@ from fastapi.templating import Jinja2Templates
 
 from src.merge_csv import merge_csv_files  # Import the merging function
 
+import logging
+
+# Configure logging with timestamps
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 db_path = "db/merged_trading.db"
 
 
@@ -79,7 +85,7 @@ def search_ticker_for_isin(security_name: str, isin: str) -> Optional[str]:
 
         return None
     except Exception as e:
-        print(f"Error searching for {security_name} ({isin}): {e}")
+        logger.error(f"Error searching for {security_name} ({isin}): {e}")
         return None
 
 
@@ -108,6 +114,7 @@ async def upload_files(
     Handle batch CSV upload, merge them, and save to merged_trading.csv (overwriting old).
     Returns JSON data for client-side rendering.
     """
+    logger.info("Endpoint /upload/ called") 
     if not files:
         return JSONResponse(
             content={"success": False, "error": "No files uploaded"},
@@ -139,10 +146,10 @@ async def upload_files(
         # Extract tickers synchronously to ensure they are available for charts
         extract_tickers_to_db()
 
-        print(
+        logger.info(
             f"DEBUG: Merged DF shape: {merged_df.shape}, Date range: {merged_df['Trade Date/Time'].min()} to {merged_df['Trade Date/Time'].max()}"
         )
-        print(
+        logger.info(
             f"DEBUG: Sample Transaction Types: {merged_df['Transaction Type'].unique()}"
         )
 
@@ -169,12 +176,12 @@ async def get_portfolio_values():
     """
     Compute and return monthly net contributions and daily actual portfolio values using yfinance.
     """
-    print("Endpoint /portfolio-values/ called")
+    logger.info("Endpoint /portfolio-values/ called")
     try:
         conn = sqlite3.connect(db_path)
         df = pd.read_sql_query("SELECT * FROM trades", conn)
-        print(f"Loaded {len(df)} trades from database")
-        print(f"Columns: {list(df.columns)}")
+        logger.info(f"Loaded {len(df)} trades from database")
+        logger.info(f"Columns: {list(df.columns)}")
         df["Trade Date/Time"] = pd.to_datetime(
             df["Trade Date/Time"], format="%Y-%m-%d %H:%M:%S", errors="coerce"
         )
@@ -182,8 +189,8 @@ async def get_portfolio_values():
         conn.close()
 
         # Log sample CSV prices and currencies
-        print("=== DEBUG: Sample CSV Trade Data ===")
-        sample_trades = df.head(5)[
+        logger.info("=== DEBUG: Sample CSV Trade Data ===")
+        sample_trades = df.head(5) [
             [
                 "Ticker",
                 "Trade Date/Time",
@@ -192,8 +199,8 @@ async def get_portfolio_values():
                 "Transaction Type",
             ]
         ]
-        print(sample_trades.to_string(index=False))
-        print("CSV prices are in GBP (from '£' removal in merge_csv.py)")
+        logger.info(sample_trades.to_string(index=False))
+        logger.info("CSV prices are in GBP (from '£' removal in merge_csv.py)")
 
         if df.empty:
             return JSONResponse(
@@ -221,7 +228,7 @@ async def get_portfolio_values():
         unique_tickers = (
             df.loc[df["Ticker"] != "Not found", "Ticker"].drop_duplicates().tolist()
         )
-        print(f"Unique valid tickers: {unique_tickers}")
+        logger.info(f"Unique valid tickers: {unique_tickers}")
         if not unique_tickers:
             return JSONResponse(
                 content={
@@ -241,20 +248,20 @@ async def get_portfolio_values():
                 reported_currencies[ticker] = reported
                 if reported != "Unknown" and reported != "GBP" and reported != "GBp":
                     needed_fx.add(reported)
-                print(f"Ticker {ticker}: Reported={reported}")
+                logger.info(f"Ticker {ticker}: Reported={reported}")
             except Exception as e:
-                print(f"Error getting currency for {ticker}: {e}")
+                logger.error(f"Error getting currency for {ticker}: {e}")
                 reported_currencies[ticker] = "GBP"
 
         # Log yfinance currencies for tickers
-        print("=== DEBUG: yfinance Currencies ===")
+        logger.info("=== DEBUG: yfinance Currencies ===")
         for ticker in unique_tickers[:3]:  # Sample first 3
             try:
                 yf_ticker = yf.Ticker(ticker)
                 currency = yf_ticker.info.get("currency", "Unknown")
-                print(f"Ticker {ticker}: Currency = {currency}")
+                logger.info(f"Ticker {ticker}: Currency = {currency}")
             except Exception as e:
-                print(f"Error getting currency for {ticker}: {e}")
+                logger.error(f"Error getting currency for {ticker}: {e}")
 
         # Compute common start date
         common_start_dates = {}
@@ -274,9 +281,11 @@ async def get_portfolio_values():
                         hist_min.date() if hasattr(hist_min, "date") else hist_min
                     )
                     common_start_dates[ticker] = min_hist
-                    print(f"Min hist date for {ticker}: {min_hist}")
+                    logger.info(f"Min hist date for {ticker}: {min_hist}")
+                else:
+                    logger.warning(f"No historical data for {ticker}")
             except Exception as e:
-                print(f"Error getting min date for {ticker}: {e}")
+                logger.error(f"Error getting min date for {ticker}: {e}")
 
         if not common_start_dates:
             return JSONResponse(
@@ -288,12 +297,12 @@ async def get_portfolio_values():
             )
 
         common_start = max(common_start_dates.values())
-        print(f"Common start date: {common_start}")
+        logger.info(f"Common start date: {common_start}")
 
         max_date = df["Trade Date/Time"].max().date()
         if common_start > max_date:
             return JSONResponse(
-                content={"success": False, "error": "No overlapping historical data"},
+                content={"success": False, "error": "No valid trade date range"},
                 status_code=404,
             )
 
@@ -317,7 +326,7 @@ async def get_portfolio_values():
             else:
                 initial_qty = 0.0
             initial_holdings[ticker] = initial_qty
-            print(f"Initial holding for {ticker}: {initial_qty}")
+            logger.info(f"Initial holding for {ticker}: {initial_qty}")
 
         # Create prices table if not exists (now for converted GBP prices)
         conn = sqlite3.connect(db_path)
@@ -343,7 +352,7 @@ async def get_portfolio_values():
             if curr in fx_config:
                 fx_ticker_str, multiply = fx_config[curr]
                 try:
-                    print(f"Fetching FX for {curr}: {fx_ticker_str}")
+                    logger.info(f"Fetching FX for {curr}: {fx_ticker_str}")
                     fx_ticker = yf.Ticker(fx_ticker_str)
                     fx_hist = fx_ticker.history(
                         start=common_start, end=max_date + pd.Timedelta(days=1)
@@ -358,24 +367,24 @@ async def get_portfolio_values():
                             fx_hist["Close"].reindex(dates).ffill().fillna(1.0)
                         )
                         fx_data[curr] = {"rates": fx_close.values, "multiply": multiply}
-                        print(
+                        logger.info(
                             f"FX rates for {curr} fetched: {len(fx_close)} days, sample: {fx_close.values[:3]}"
                         )
                     else:
-                        print(f"No FX data for {curr}, assuming 1:1")
+                        logger.warning(f"No FX data for {curr}, assuming 1:1")
                         fx_data[curr] = {"rates": np.ones(len(dates)), "multiply": multiply}
                 except Exception as e:
-                    print(f"Error fetching FX for {curr}: {e}, assuming 1:1")
+                    logger.error(f"Error fetching FX for {curr}: {e}, assuming 1:1")
                     fx_data[curr] = {"rates": np.ones(len(dates)), "multiply": multiply}
             else:
-                print(f"Unsupported currency {curr}, assuming prices in GBP")
+                logger.warning(f"Unsupported currency {curr}, assuming prices in GBP")
         if not needed_fx:
-            print("All currencies are GBP or GBp, no FX needed")
+            logger.info("All currencies are GBP or GBp, no FX needed")
 
-        print(
+        logger.info(
             f"DEBUG HOLDINGS: common_start = {common_start}, max_date = {max_date}, num_days = {len(dates)}"
         )
-        print(
+        logger.info(
             f"DEBUG HOLDINGS: date range min {min([d.date() for d in dates])}, max {max([d.date() for d in dates])}"
         )
 
@@ -392,9 +401,9 @@ async def get_portfolio_values():
                 .copy()
             )
             initial_qty = initial_holdings.get(ticker, 0.0)
-            print(f"DEBUG HOLDINGS [{ticker}]: initial_qty = {initial_qty}")
+            logger.info(f"DEBUG HOLDINGS [{ticker}]: initial_qty = {initial_qty}")
             if ticker_trades.empty:
-                print(
+                logger.info(
                     f"DEBUG HOLDINGS [{ticker}]: No trades >= {common_start}, setting all to initial_qty = {initial_qty}"
                 )
                 holdings_data[ticker] = np.full(len(dates), initial_qty)
@@ -411,11 +420,11 @@ async def get_portfolio_values():
             daily_adj = ticker_trades.groupby(ticker_trades["Trade Date/Time"].dt.date)[
                 "Quantity_Adj"
             ].sum()
-            print(
+            logger.info(
                 f"DEBUG HOLDINGS [{ticker}]: Number of unique trade dates: {len(daily_adj)}, total adj: {daily_adj.sum()}"
             )
             if len(daily_adj) > 0:
-                print(
+                logger.info(
                     f"DEBUG HOLDINGS [{ticker}]: Sample daily adj: {dict(list(daily_adj.items())[:3])}"
                 )
 
@@ -425,27 +434,27 @@ async def get_portfolio_values():
             for i, date in enumerate(dates):
                 adj_today = daily_adj.get(date.date(), 0.0)
                 if abs(adj_today) > 1e-6:  # Log only significant adjustments
-                    print(
+                    logger.info(
                         f"DEBUG HOLDINGS [{ticker}]: On {date.date()} (idx {i}), adj={adj_today:.6f}, cum before={cum_qty:.6f}"
                     )
                 cum_qty += adj_today
                 daily_holdings.iloc[i] = cum_qty
                 if abs(adj_today) > 1e-6:
-                    print(f"DEBUG HOLDINGS [{ticker}]: Updated to cum={cum_qty:.6f}")
+                    logger.info(f"DEBUG HOLDINGS [{ticker}]: Updated to cum={cum_qty:.6f}")
 
             # No NaNs or ffill needed; all days explicitly set with carry-forward
-            print(
+            logger.info(
                 f"DEBUG HOLDINGS [{ticker}]: Final: NaNs={daily_holdings.isna().sum()}, min={daily_holdings.min():.6f}, max={daily_holdings.max():.6f}"
             )
             non_zero_count = (
                 abs(daily_holdings) > 1e-6
             ).sum()  # Ignore floating-point zeros
-            print(
+            logger.info(
                 f"DEBUG HOLDINGS [{ticker}]: non-zero days: {non_zero_count} / {len(daily_holdings)}, max holding: {daily_holdings.max() if non_zero_count > 0 else 0}"
             )
             holdings_data[ticker] = daily_holdings.values
 
-        # Fetch/cache prices
+        # Fetch/cache prices, fetching full history and ffill for missing early data
         price_data = {}
         for ticker in unique_tickers:
             # Check cached prices for the range
@@ -462,16 +471,16 @@ async def get_portfolio_values():
                 cached_prices = (
                     cached.reindex(date_list).ffill()["close"].fillna(0.0).values
                 )
-                print(
+                logger.info(
                     f"Cached prices for {ticker}: non-zero count = {np.count_nonzero(np.array(cached_prices) > 0)} out of {len(cached_prices)}"
                 )
             else:
                 cached_prices = np.zeros(len(dates))
-                print(f"No cached prices for {ticker}")
+                logger.info(f"No cached prices for {ticker}")
 
-            # If any missing (0.0), fetch
+            # If any missing (0.0), fetch full history
             if np.any(np.array(cached_prices) == 0.0):
-                print(
+                logger.info(
                     f"Fetching history for {ticker} from {common_start} to {max_date}"
                 )
                 try:
@@ -479,12 +488,12 @@ async def get_portfolio_values():
                     hist = yf_ticker.history(
                         start=common_start, end=max_date + pd.Timedelta(days=1)
                     )
-                    print(f"Hist length for {ticker}: {len(hist)}")
-                    print(
+                    logger.info(f"Hist length for {ticker}: {len(hist)}")
+                    logger.info(
                         f"Hist date range for {ticker}: {hist.index.min()} to {hist.index.max()}"
                     )
                     if len(hist) > 0:
-                        print(
+                        logger.info(
                             f"Sample hist dates for {ticker}: {hist.index[:3].tolist() if len(hist) >= 3 else hist.index.tolist()}"
                         )
                         # Remove timezone from hist DataFrame to match naive dates
@@ -504,29 +513,29 @@ async def get_portfolio_values():
                         if is_lse:
                             if reported == "GBp":
                                 converted_prices = prices / 100.0
-                                print(f"Converted {ticker} (LSE, GBp) to GBP (divided by 100)")
+                                logger.info(f"Converted {ticker} (LSE, GBp) to GBP (divided by 100)")
                             elif reported == "USD":
                                 # Convert USD to GBP even for LSE
                                 fx_info = fx_data.get("USD")
                                 if fx_info:
                                     rates_series = pd.Series(fx_info["rates"], index=dates)
                                     converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
-                                    print(f"Converted {ticker} (LSE, reported USD) to GBP using FX rates")
+                                    logger.info(f"Converted {ticker} (LSE, reported USD) to GBP using FX rates")
                                 else:
-                                    print(f"No FX for USD on {ticker}, assuming already in GBP")
+                                    logger.info(f"No FX for USD on {ticker}, assuming already in GBP")
                             else:
-                                print(f"{ticker} (LSE, {reported}) assumed in GBP, no change")
+                                logger.info(f"{ticker} (LSE, {reported}) assumed in GBP, no change")
                         else:
                             # Non-LSE: use reported
                             if reported == "GBp":
                                 converted_prices = prices / 100.0
-                                print(f"Converted {ticker} GBp to GBP (divided by 100)")
+                                logger.info(f"Converted {ticker} GBp to GBP (divided by 100)")
                             elif reported == "USD":
                                 fx_info = fx_data.get("USD")
                                 if fx_info:
                                     rates_series = pd.Series(fx_info["rates"], index=dates)
                                     converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
-                                    print(f"Converted {ticker} USD to GBP using FX rates")
+                                    logger.info(f"Converted {ticker} USD to GBP using FX rates")
                             elif reported != "GBP":
                                 # Handle other currencies if needed
                                 fx_info = fx_data.get(reported)
@@ -536,17 +545,17 @@ async def get_portfolio_values():
                                         converted_prices = prices * rates_series.reindex(dates).ffill().fillna(1.0)
                                     else:
                                         converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
-                                    print(f"Converted {ticker} {reported} to GBP using FX rates")
+                                    logger.info(f"Converted {ticker} {reported} to GBP using FX rates")
                                 else:
-                                    print(f"No FX info for {reported} on {ticker}, assuming already in GBP")
+                                    logger.info(f"No FX info for {reported} on {ticker}, assuming already in GBP")
                             else:
-                                print(f"{ticker} ({reported}) assumed in GBP, no change")
+                                logger.info(f"{ticker} ({reported}) assumed in GBP, no change")
 
                         # Replace any remaining NaN with 0
                         converted_prices = converted_prices.fillna(0.0)
 
                         non_zero = (converted_prices > 0).sum()
-                        print(
+                        logger.info(
                             f"Non-zero converted prices for {ticker}: {non_zero} out of {len(converted_prices)}"
                         )
 
@@ -579,11 +588,11 @@ async def get_portfolio_values():
                                     converted_prices
                                 ):
                                     yf_converted = converted_prices.iloc[price_idx]
-                                    print(
+                                    logger.info(
                                         f"Sample comparison for {ticker} on ~{sample_trade_date}: CSV £{sample_csv_price:.2f} vs yf Converted GBP £{yf_converted:.2f}"
                                     )
                                 else:
-                                    print(
+                                    logger.info(
                                         f"Invalid index for sample comparison for {ticker}"
                                     )
 
@@ -599,16 +608,16 @@ async def get_portfolio_values():
                         conn.commit()
                         price_data[ticker] = converted_prices.values
                     else:
-                        print(f"No historical data returned for {ticker}")
+                        logger.info(f"No historical data returned for {ticker}")
                         price_data[ticker] = cached_prices
                 except Exception as e:
-                    print(f"Exception fetching {ticker}: {e}")
+                    logger.info(f"Exception fetching {ticker}: {e}")
                     import traceback
 
-                    traceback.print_exc()
+                    traceback.logger.info_exc()
                     price_data[ticker] = cached_prices
             else:
-                print(f"All prices cached for {ticker}, using cache")
+                logger.info(f"All prices cached for {ticker}, using cache")
                 # Assume cached are already converted GBP
                 price_data[ticker] = cached_prices
 
@@ -618,7 +627,7 @@ async def get_portfolio_values():
         for ticker in unique_tickers:
             arr = np.array(price_data[ticker])
             if len(arr) != len(dates):
-                print(
+                logger.warning(
                     f"Warning: price_data length mismatch for {ticker}: {len(arr)} vs {len(dates)}, adjusting"
                 )
                 if len(arr) < len(dates):
@@ -649,7 +658,7 @@ async def get_portfolio_values():
         )
 
     except Exception as e:
-        print(f"Error in get_portfolio_values: {e}")
+        logger.error(f"Error in get_portfolio_values: {e}")
         import traceback
 
         traceback.print_exc()
@@ -697,12 +706,12 @@ def extract_tickers_to_db():
         df.to_sql("trades", conn, if_exists="replace", index=False)
         conn.close()
 
-        print(
+        logger.info(
             f"Tickers extracted and added to database for {len(unique_securities)} unique securities"
         )
 
     except Exception as ticker_err:
-        print(f"Ticker extraction error: {ticker_err}")
+        logger.error(f"Ticker extraction error: {ticker_err}")
         import traceback
 
         traceback.print_exc()
