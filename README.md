@@ -3,20 +3,45 @@
 A Python web server for uploading batches of trading statement CSV files (e.g., GIA and ISA accounts), merging them into a unified SQLite database with an added `Account_Type` column and `Ticker` enrichment. The upload endpoint handles merging and saving to DB, while a separate endpoint computes and returns data for interactive graphs: a histogram of monthly net contributions (buys positive, sells negative) and a line graph of actual portfolio value over time (including asset price changes via historical prices from yfinance). Each new upload overwrites the previous merged data to keep only the latest batch. Graphs are embedded directly in the page after upload and chart generation (no download needed). Tickers are extracted in the background using Yahoo Finance API searches.
 
 ## Features
-- Web interface for batch file uploads using FastAPI and HTMX
-- Automatic parsing and merging of trading statement CSVs using Pandas
-- CSV preprocessing: skips title rows, cleans currency formatting (£ and commas), parses dates, and standardizes columns
-- Stores merged data in a SQLite database (`db/merged_trading.db`) that overwrites on each new upload
-- Ticker extraction using Yahoo Finance search API with ISIN lookup (preferring LSE/.L tickers when available)
-- Multi-currency price conversion with FX rate handling (GBp, USD, EUR) to ensure consistent GBP valuations
-- Caching system for historical prices and FX rates to optimize performance and reduce API calls
-- Parallel processing of ticker lookups and price fetching for improved performance
-- Separate endpoints: `/upload/` for data processing and storage, `/portfolio-values/` for portfolio calculations
-- Portfolio value calculation that simulates daily holdings and forward-fills for non-trade days
-- Interactive Plotly charts for monthly net contributions and portfolio value over time
-- Uses UV for dependency management, Jinja2 for templating, and HTMX for dynamic web interactions
+
+### Core Functionality
+- **Web interface** for batch file uploads using FastAPI and HTMX
+- **Automatic CSV parsing** and merging of trading statements using Pandas
+- **CSV preprocessing**: Skips title rows, cleans currency formatting (£ and commas), parses dates, standardizes columns
+- **Database storage** in SQLite (`db/merged_trading.db`) with overwrite-on-upload behavior
+
+### Ticker Extraction & Price Data
+- **Yahoo Finance integration** for ticker extraction using ISIN lookup
+- **Smart ticker matching**: Prefers LSE exchange (.L suffix) and ETF/Equity types
+- **Multi-currency support**: Handles GBP, GBp (LSE pence), USD, EUR with automatic conversion to GBP
+- **FX rate handling**: Real-time FX rates for USD and EUR with intelligent caching
+- **Parallel processing**: Concurrent ticker lookups and price fetching (5-thread worker pools)
+- **Comprehensive caching**: Historical prices and FX rates cached in SQLite to minimize API calls
+
+### Portfolio Calculations
+- **Monthly net contributions**: Histogram showing net cash flow (buys positive, sells negative)
+- **Daily portfolio values**: Line graph of actual portfolio value including asset price changes
+- **Holdings simulation**: Cumulative holdings calculation with forward-fill for non-trade days
+- **Real-time valuations**: Uses historical closing prices from yfinance converted to GBP
+- **Precomputation**: Background processing of yfinance data for instant chart generation
+
+### API Endpoints
+- `GET /` - Upload form page
+- `POST /reset/` - Reset database before new uploads
+- `POST /upload/` - Process and merge CSV files (with ticker extraction and background processing)
+- `GET /portfolio-values/` - Retrieve precomputed portfolio data (daily values + monthly contributions)
+- `GET /export/trades/` - Export entire trades table as JSON
+- `GET /export/prices/` - Export ticker prices with original and converted values
+
+### Performance & Architecture
+- **Background processing**: Asynchronous yfinance data collection triggered on upload
+- **Intelligent caching**: Prices cached by (ticker, date) with OR REPLACE semantics
+- **Precomputed tables**: Fast retrieval of portfolio values, monthly contributions, and ticker prices
+- **Concurrent operations**: ThreadPoolExecutor for parallel API calls and data processing
+- **State management**: Precomputation status tracking with completion monitoring
 
 ## Project Structure
+
 ```
 .
 ├── .gitignore                     # Git ignore rules (excludes venv, __pycache__, *.db, trading_statements/)
@@ -27,24 +52,32 @@ A Python web server for uploading batches of trading statement CSV files (e.g., 
 │   └── settings.json             # VSCode settings with Ruff linting/formatting
 ├── src/
 │   ├── __init__.py               # Package init
-│   ├── main.py                   # FastAPI application with upload and portfolio-value endpoints
-│   ├── merge_csv.py              # CSV parsing and merging logic
+│   ├── main.py                   # FastAPI application with all API endpoints
+│   ├── database.py               # Database operations (CRUD, connections, caching)
+│   ├── merge_csv.py              # CSV parsing, cleaning, and merging logic
+│   ├── tickers.py                # Ticker extraction via Yahoo Finance API
+│   ├── prices.py                 # Price fetching, currency detection, and FX conversion
+│   ├── portfolio.py              # Portfolio value calculations and holdings simulation
+│   ├── background_processor.py   # Asynchronous precomputation of yfinance data
 │   ├── temp-tests/               # Testing and development utilities
-│   │   ├── extract_tickers.py    # Standalone ticker extraction script for existing DB
-│   │   ├── test_merge.py         # Test script for merging sample CSVs
-│   │   ├── get_historical_data.py # Utility to fetch historical yfinance data
-│   │   └── test_price_factors.py # Price comparison and factor detection tool
+│   │   ├── extract_tickers.py    # Standalone ticker extraction for existing DB
+│   │   ├── test_merge.py         # Test merging without web interface
+│   │   ├── get_historical_data.py # Fetch and inspect historical yfinance data
+│   │   └── test_price_factors.py # Compare CSV vs yfinance prices for debugging
 │   └── templates/
 │       └── upload.html           # Upload form with HTMX and Plotly integration
 ├── tests/                        # Comprehensive test suite (see tests/README.md)
-│   ├── conftest.py               # Pytest fixtures and test configuration
-│   ├── test_merge_csv.py         # Unit tests for CSV merging
-│   ├── test_tickers.py           # Unit tests for ticker extraction
-│   ├── test_portfolio.py         # Unit tests for portfolio calculations
-│   └── test_integration.py       # Integration tests for FastAPI endpoints
+│   ├── conftest.py               # Pytest fixtures and configuration
+│   ├── test_database.py          # Database operation unit tests
+│   ├── test_merge_csv.py         # CSV merging unit tests
+│   ├── test_tickers.py           # Ticker extraction unit tests
+│   ├── test_prices.py            # Price fetching and currency conversion tests
+│   ├── test_portfolio.py         # Portfolio calculation unit tests
+│   ├── test_background_processor.py # Background processing tests
+│   └── test_integration.py       # FastAPI endpoint integration tests
 ├── htmlcov/                      # Coverage reports (auto-generated by pytest)
 ├── db/                           # Database directory (auto-created on first run)
-│   └── merged_trading.db         # SQLite database with trades and prices tables
+│   └── merged_trading.db         # SQLite with trades, prices, and precomputed tables
 └── trading_statements/           # Sample CSV files (not committed, add your own)
     ├── GIA_Trading_statement_*.csv
     └── ISA_Trading_statement_*.csv
@@ -72,49 +105,62 @@ A Python web server for uploading batches of trading statement CSV files (e.g., 
    - Access the app at `http://localhost:8000`.
 
 ## Usage
+
+### Initial Setup
 1. Open `http://localhost:8000` in your browser to see the upload form.
-2. Select multiple CSV files (e.g., `GIA_Trading_statement_*.csv`, `ISA_Trading_statement_*.csv`) using the "Browse Files" button.
-3. The form submits automatically on file selection. The server will:
-   - Parse each file (skip first row title, use second as header, add `Account_Type` based on filename like 'GIA' or 'ISA').
-   - Merge into `db/merged_trading.db` (overwriting any existing data).
-   - Extract tickers in the background for unique securities (adds `Ticker` column; may take a few seconds).
-   - Display a success message with total transactions and date range, plus a "Generate Charts" button.
-4. Click "Generate Charts" to compute and display interactive graphs: histogram of net monthly contributions and line graph of actual portfolio value over time (including price changes).
-5. Upload another batch to regenerate the database; click "Generate Charts" to update graphs.
+2. **IMPORTANT**: Click the reset button or call `/reset/` endpoint to clear any existing data.
+3. Select multiple CSV files (e.g., `GIA_Trading_statement_*.csv`, `ISA_Trading_statement_*.csv`) using the "Browse Files" button.
 
-## Running Tests
+### Upload Process
+The form submits automatically on file selection. The server will:
+- Parse each file (skip first row title, use second as header, add `Account_Type` based on filename like 'GIA' or 'ISA')
+- Merge into `db/merged_trading.db` (overwriting any existing data)
+- Extract tickers for unique securities (queries Yahoo Finance, may take a few seconds)
+- Start **background processing** of yfinance data for all tickers
+- Display success message with transaction count, date range, and "Generate Charts" button
 
-The project includes a comprehensive test suite. See `tests/README.md` for detailed test documentation.
+### Chart Generation
+4. Click "Generate Charts" to view interactive graphs:
+   - **Monthly Net Contributions Histogram**: Net cash flow per month (buys positive, sells negative)
+   - **Portfolio Value Line Graph**: Daily portfolio value over time with price appreciation
 
-### Quick Test Commands
+### Data Export
+Access these endpoints for data export:
+- `/export/trades/` - Full trades table as JSON
+- `/export/prices/` - Ticker prices with original and GBP-converted values
 
-```bash
-# Install test dependencies
-uv sync --extra test
+### Upload Another Batch
+Click "Upload another batch" to reset the form and repeat the process with new files.
 
-# Run all tests with coverage
-pytest
+## Database Schema
 
-# Run unit tests only
-pytest -m unit
+The SQLite database contains the following tables:
 
-# Run integration tests only
-pytest -m integration
+### Core Tables
+**trades** - Merged transaction data from CSV uploads
+- `Security / ISIN`, `Transaction Type`, `Quantity`, `Share Price`, `Total Trade Value`
+- `Trade Date/Time`, `Settlement Date`, `Broker`, `Account_Type`, `Ticker`
 
-# Skip slow tests that require network
-pytest -m "not slow"
+**prices** - Cached historical prices and FX rates
+- `ticker` (TEXT), `date` (DATE), `close` (REAL)
+- Primary key: `(ticker, date)`
+- Automatically populated during price fetching and FX rate queries
 
-# View detailed coverage report
-pytest --cov=src --cov-report=term-missing
-```
+### Precomputed Tables (for performance)
+**precomputed_portfolio_values** - Daily portfolio values
+- `date` (DATE PRIMARY KEY), `daily_value` (REAL), `last_updated` (TIMESTAMP)
 
-### Test Categories
+**precomputed_monthly_contributions** - Monthly net contributions
+- `month` (TEXT PRIMARY KEY), `net_value` (REAL), `last_updated` (TIMESTAMP)
 
-- **Unit Tests**: Test CSV parsing, ticker extraction, and portfolio calculation logic in isolation
-- **Integration Tests**: Test FastAPI endpoints and full workflow from upload to chart generation
-- **Slow Tests**: Tests that call real external APIs (yfinance, network requests)
+**precomputed_ticker_prices** - Ticker prices (original and converted)
+- `ticker` (TEXT), `date` (DATE), `original_currency` (TEXT)
+- `original_price` (REAL), `converted_price_gbp` (REAL), `last_updated` (TIMESTAMP)
+- Primary key: `(ticker, date)`
 
-See `tests/README.md` for comprehensive testing documentation including fixtures, mocking strategies, and CI/CD integration.
+**precompute_status** - Background processing metadata
+- `id`, `status`, `started_at`, `completed_at`, `total_tickers`, `last_error`
+- Tracks background yfinance data collection progress
 
 ## Test Utilities (src/temp-tests/)
 
@@ -144,50 +190,64 @@ uv run python src/temp-tests/test_price_factors.py
 ```
 Advanced analysis tool that compares CSV prices to yfinance prices for the same dates to detect constant multiplication factors (useful for identifying unit discrepancies like pence vs pounds). Also tests FX conversion logic.
 
-## CSV Format Assumptions
-- Row 1: Title (ignored)
-- Row 2: Headers with these expected columns:
-  - `Security / ISIN`
-  - `Transaction Type`
-  - `Quantity`
-  - `Share Price`
-  - `Total Trade Value`
-  - `Trade Date/Time`
-  - `Settlement Date`
-  - `Broker`
-- Data rows: Transaction records
-- Currency formatting: Fields with '£' symbols and commas are automatically cleaned to float values
-- Date formats: `dd/mm/yy HH:MM:SS` (preferred) or `dd/mm/yy` (fallback)
-- Account type detection: Extracted from filename (e.g., 'GIA_' → 'GIA', 'ISA_' → 'ISA') with fallback text search
-- Security / ISIN format example: `"Vanguard FTSE Developed World UCITS ETF / ISIN GB00B3XXRP09"` (regex parses name and ISIN for ticker lookup)
+## Background Processing
+
+The system includes a sophisticated background processing system that precomputes yfinance data:
+
+### What Gets Precomputed
+1. **Ticker Prices**: Fetches historical prices for all valid tickers
+2. **Currency Detection**: Identifies reported currency for each ticker
+3. **FX Rate Collection**: Gathers historical FX rates for non-GBP securities
+4. **Portfolio Values**: Calculates daily portfolio values based on holdings × prices
+5. **Monthly Contributions**: Computes net monthly cash flow
+
+### How It Works
+- Triggered automatically on successful file upload via `BackgroundTasks`
+- Processes all unique tickers in parallel using ThreadPoolExecutor
+- Stores both original prices (in reported currency) and GBP-converted prices
+- Caches all fetched data to minimize future API calls
+- Status tracked in `precompute_status` table
+
+### Performance Benefits
+- **Instant charts**: Precomputed data eliminates wait time when clicking "Generate Charts"
+- **Reduced API calls**: Caching prevents redundant yfinance queries
+- **Fresh data check**: System validates precomputed data is recent (<24 hours)
+- **Fallback available**: If no precomputed data, falls back to live calculation
 
 ## Graphs Explanation
-- **Monthly Net Contributions Histogram**: Bars show net cash flow per month (positive for buys/investments, negative for sells/withdrawals). Combines GIA and ISA data for a holistic view of contributions/distributions.
-- **Actual Portfolio Value Line Graph**: Daily portfolio value over time based on simulated holdings from trades multiplied by historical closing prices from yfinance. The calculation:
-  - Simulates holdings cumulatively (buys increase shares, sells decrease them)
-  - Forward-fills holdings for non-trade days
-  - Fetches and converts all historical prices to GBP using proper currency conversions
-  - Applies FX rates for non-GBP securities (historic rates cached to avoid refetching)
-  - Calculates daily value as Σ(holdings × price) across all tickers
-  - Aggregates across all account types; invalid tickers contribute 0 value
-- Charts are interactive (zoom, hover) via Plotly and rendered client-side from server-computed data
+
+### Monthly Net Contributions Histogram
+Bars show net cash flow per month (positive for buys/investments, negative for sells/withdrawals). Combines GIA and ISA data for a holistic view of contributions/distributions across all accounts.
+
+### Actual Portfolio Value Line Graph
+Daily portfolio value over time calculated using:
+1. **Holdings Simulation**: Cumulative holdings from trades (buys increase shares, sells decrease them)
+2. **Forward-Fill**: Holdings carried forward for non-trade days
+3. **Price Conversion**: Historical closing prices from yfinance converted to GBP
+4. **FX Rate Application**: Historic FX rates cached to avoid refetching
+5. **Daily Valuation**: Σ(holdings × price) across all tickers and account types
+6. **Invalid Handling**: Invalid or "Not found" tickers contribute 0 value
+
+Charts are interactive (zoom, hover) via Plotly and rendered client-side from server-computed data.
 
 ## Ticker Extraction
-- **Extraction Process**: For each unique "Security / ISIN", the system:
-  - Parses security name and ISIN using regex
-  - Searches Yahoo Finance API by security name (primary method)
-  - Prefers LSE exchange or .L suffix tickers, with ETF/Equity quote types
-  - Falls back to ISIN-based search if name search yields no results
-  - Stores results in database `Ticker` column (e.g., "VUSA.L" or "Not found")
-- **Price Caching**: The system maintains two tables in SQLite:
-  - `trades`: Merged transaction data with ticker mappings
-  - `prices`: Historical prices and FX rates indexed by ticker and date to avoid refetching
-- **Multi-Currency Handling**:
-  - Detects currency for each ticker (GBP, GBp, USD, EUR, etc.)
-  - Converts GBp prices (pence) to GBP by dividing by 100
-  - Fetches appropriate FX rates for non-GBP securities (GBPUSD=X, EURGBP=X)
-  - Caches FX rates to optimize performance
-- Note: Yahoo Finance API may rate-limit requests; extraction happens synchronously during upload to ensure tickers are available for charts
+
+### Extraction Process
+For each unique "Security / ISIN", the system:
+1. Parses security name and ISIN using regex pattern: `(.*?)/\s*ISIN\s+([A-Z]{2}[A-Z0-9]{9}[0-9])`
+2. Searches Yahoo Finance API by security name (primary method)
+3. Prefers LSE exchange (.L suffix) and ETF/Equity quote types
+4. Falls back to ISIN-based search if name search yields no results
+5. Stores results in `Ticker` column (e.g., "VUSA.L" or "Not found")
+
+### Multi-Currency Handling
+- **Currency Detection**: Queries yfinance for each ticker's reported currency
+- **GBp Conversion**: Automatically converts LSE pence prices (GBp) to GBP by dividing by 100
+- **FX Rate Conversion**: Fetches historic FX rates (GBPUSD=X, EURGBP=X) for non-GBP securities
+- **Caching Strategy**: All prices and FX rates cached in SQLite `prices` table by (ticker, date)
+
+### API Rate Limiting
+Yahoo Finance API may rate-limit requests. Extraction happens synchronously during upload, but subsequent price fetching runs in background to improve user experience.
 
 ## Development Notes
 
