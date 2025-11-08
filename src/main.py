@@ -17,6 +17,7 @@ from .database import (
 )
 from .tickers import add_tickers_to_df
 from .portfolio import calculate_portfolio_values
+from .background_processor import precompute_portfolio_data, get_precomputed_portfolio_data, export_precomputed_data, create_precomputed_tables
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -41,6 +42,7 @@ async def reset_database_endpoint():
     try:
         reset_database()
         create_prices_table()
+        create_precomputed_tables()
         logger.info("Database reset successfully")
         return JSONResponse(
             content={
@@ -136,6 +138,10 @@ async def upload_files(
         df_with_tickers = add_tickers_to_df(merged_df)
         save_trades(df_with_tickers)
 
+        # Trigger background processing of yfinance data
+        logger.info("Starting background yfinance data collection...")
+        background_tasks.add_task(precompute_portfolio_data, df_with_tickers)
+
         logger.info(
             f"DEBUG: Merged DF shape: {merged_df.shape}, "
             f"Date range: {merged_df['Trade Date/Time'].min()} to {merged_df['Trade Date/Time'].max()}"
@@ -193,17 +199,22 @@ async def get_portfolio_values():
         # Ensure prices table exists
         create_prices_table()
 
-        # Calculate portfolio values
-        result = calculate_portfolio_values(df)
+        # Try to get precomputed data first (faster)
+        result = get_precomputed_portfolio_data()
 
         if result is None:
-            return JSONResponse(
-                content={
-                    "success": False,
-                    "error": "Failed to calculate portfolio values"
-                },
-                status_code=500,
-            )
+            # Fallback to live calculation if precomputed data not available
+            logger.warning("Precomputed data not available, falling back to live calculation...")
+            result = calculate_portfolio_values(df)
+
+            if result is None:
+                return JSONResponse(
+                    content={
+                        "success": False,
+                        "error": "Failed to calculate portfolio values"
+                    },
+                    status_code=500,
+                )
 
         return JSONResponse(
             content={
@@ -214,6 +225,33 @@ async def get_portfolio_values():
 
     except Exception as e:
         logger.error(f"Error in get_portfolio_values: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500
+        )
+
+
+@app.get("/export/prices/")
+async def export_precomputed_portfolio_data():
+    """
+    Export all precomputed portfolio data including daily values, monthly contributions, and metadata.
+    Returns the entire precomputed dataset in JSON format containing prices and related calculations.
+    """
+    try:
+        data = export_precomputed_data()
+
+        if "error" in data:
+            return JSONResponse(
+                content={"success": False, "error": data["error"]},
+                status_code=500
+            )
+
+        return JSONResponse(content={"success": True, **data})
+
+    except Exception as e:
+        logger.error(f"Error exporting precomputed portfolio data: {e}")
         import traceback
         traceback.print_exc()
         return JSONResponse(

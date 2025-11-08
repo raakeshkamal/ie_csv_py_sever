@@ -30,12 +30,15 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
 
 
 def reset_database(db_path: Optional[str] = None):
-    """Reset the database by dropping trades and prices tables."""
+    """Reset the database by dropping all tables."""
     ensure_db_directory(db_path)
     conn = get_connection(db_path)
     try:
         conn.execute("DROP TABLE IF EXISTS trades")
         conn.execute("DROP TABLE IF EXISTS prices")
+        conn.execute("DROP TABLE IF EXISTS precomputed_portfolio_values")
+        conn.execute("DROP TABLE IF EXISTS precomputed_monthly_contributions")
+        conn.execute("DROP TABLE IF EXISTS precompute_status")
         conn.commit()
     finally:
         conn.close()
