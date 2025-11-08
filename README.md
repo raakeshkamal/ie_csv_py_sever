@@ -40,6 +40,12 @@ A Python web server for uploading batches of trading statement CSV files (e.g., 
 - **Concurrent operations**: ThreadPoolExecutor for parallel API calls and data processing
 - **State management**: Precomputation status tracking with completion monitoring
 
+### Security
+- **HTTP Basic Authentication**: All API endpoints require authentication (username/password)
+- **Environment-based credentials**: Configure credentials via `AUTH_USERNAME` and `AUTH_PASSWORD` environment variables
+- **HTTPS support**: Caddy reverse proxy provides automatic TLS certificates via Let's Encrypt
+- **Security headers**: Includes HSTS, X-Content-Type-Options, X-Frame-Options, and X-XSS-Protection
+
 ## Project Structure
 
 ```
@@ -97,12 +103,21 @@ A Python web server for uploading batches of trading statement CSV files (e.g., 
    uv sync
    ```
 
-3. **Run the Server**:
+3. **Configure Authentication** (Optional but recommended):
+   Set environment variables for authentication credentials:
+   ```bash
+   export AUTH_USERNAME="your_username"
+   export AUTH_PASSWORD="your_strong_password"
+   ```
+   Defaults are: username=`admin`, password=`password` (change these for production!)
+
+4. **Run the Server**:
    ```
    uv run uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
    ```
    - `--reload` enables auto-reload for development.
    - Access the app at `http://localhost:8000`.
+   - You'll be prompted for credentials when accessing any endpoint.
 
 ## Usage
 
@@ -131,6 +146,19 @@ Access these endpoints for data export:
 
 ### Upload Another Batch
 Click "Upload another batch" to reset the form and repeat the process with new files.
+
+### Authentication
+All API endpoints require HTTP Basic Authentication. You'll be prompted for credentials when accessing:
+- The upload form at `/`
+- Any API endpoint (`/reset/`, `/upload/`, `/portfolio-values/`, `/export/trades/`, `/export/prices/`)
+
+**Configure credentials**:
+```bash
+export AUTH_USERNAME="your_username"
+export AUTH_PASSWORD="your_secure_password"
+```
+
+Default credentials are `admin`/`password` - **change these for production use!**
 
 ## Database Schema
 
@@ -283,15 +311,75 @@ Yahoo Finance API may rate-limit requests. Extraction happens synchronously duri
 - `get_historical_data.py`: Fetch and inspect historical yfinance data
 - `test_price_factors.py`: Analyze price ratios between CSV and yfinance data
 
-### Production Considerations
+### Production Deployment
 
-- Remove `--reload` flag
-- Use Gunicorn or similar production server
-- Implement HTTPS
-- Consider Redis or similar for distributed caching in multi-server setups
-- Monitor Yahoo Finance API rate limits (consider request throttling)
-- Add authentication/authorization for upload endpoint
-- Implement database backups if historical data preservation is needed
+#### Using Docker Compose (Recommended)
+
+1. Edit `Caddyfile` and replace `192.168.1.100` with your server's actual IP address
+
+2. Set secure authentication credentials:
+   ```bash
+   export AUTH_USERNAME="secure_user"
+   export AUTH_PASSWORD="very_secure_password_123!"
+   ```
+
+3. Run with Docker Compose:
+   ```bash
+   docker-compose up -d
+   ```
+
+4. Access at `https://your-ip-address`
+   - ⚠️ Browser will show "Not Secure" warning (click "Advanced" → "Proceed")
+   - Your traffic is still encrypted, but certificates are self-signed
+
+Caddy features:
+- HTTPS with self-signed certificates for IP addresses
+- Automatic HTTP to HTTPS redirect
+- Security headers (HSTS, etc.)
+- Request logging
+
+**Note**: Since plain IP addresses can't use Let's Encrypt certificates, browsers show warnings even though traffic is encrypted. This is normal and acceptable for private use.
+
+#### Manual Production Server
+1. Set authentication credentials via environment variables
+2. Use Gunicorn with Uvicorn workers:
+   ```bash
+   pip install gunicorn
+   gunicorn src.main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
+   ```
+3. Configure a reverse proxy (Nginx, Caddy, etc.) for HTTPS termination
+4. Set up SSL certificates (Let's Encrypt recommended)
+
+#### Production Security Checklist
+- ✅ Change default credentials (`admin`/`password`)
+- ✅ Use HTTPS in production (via Caddy, Nginx, or similar)
+- ✅ Set strong passwords
+- ✅ Configure firewall to restrict access (limit to specific IPs if needed)
+- ✅ Enable rate limiting on upload endpoint
+- ✅ Monitor logs for suspicious activity
+- ✅ Keep dependencies updated
+- ✅ Use environment variables for all secrets (never hardcode credentials)
+- ✅ Implement database backups
+- ✅ Enable logging and monitoring
+
+### Development vs Production
+
+**Development**:
+```bash
+uv run uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+```
+- HTTP (no TLS)
+- Basic auth enabled
+- Auto-reload on code changes
+
+**Production**:
+```bash
+docker-compose up -d
+```
+- HTTPS with automatic TLS
+- Secure authentication
+- Production-ready logging
+- Containerized deployment
 
 ## Troubleshooting
 

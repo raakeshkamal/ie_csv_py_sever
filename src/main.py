@@ -2,9 +2,10 @@ import logging
 from typing import List, Dict, Any
 
 import pandas as pd
-from fastapi import BackgroundTasks, FastAPI, File, Request, UploadFile, HTTPException
+from fastapi import BackgroundTasks, FastAPI, File, Request, UploadFile, HTTPException, Depends, Security
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from .merge_csv import merge_csv_files
 from .database import (
@@ -26,15 +27,40 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="InvestEngine CSV Server")
 templates = Jinja2Templates(directory="src/templates")
 
+# HTTP Basic Auth configuration
+security = HTTPBasic()
+
+# Default credentials - override via environment variables
+# Example: export AUTH_USERNAME="admin" && export AUTH_PASSWORD="secret123"
+import os
+AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "password")
+
+
+def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
+    """
+    Verify HTTP Basic Auth credentials.
+    """
+    correct_username = AUTH_USERNAME == credentials.username
+    correct_password = AUTH_PASSWORD == credentials.password
+
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials
+
 
 @app.get("/", response_class=HTMLResponse)
-async def upload_page(request: Request):
+async def upload_page(request: Request, auth: HTTPBasicCredentials = Depends(verify_credentials)):
     """Render the upload form page."""
     return templates.TemplateResponse("upload.html", {"request": request})
 
 
 @app.post("/reset/")
-async def reset_database_endpoint():
+async def reset_database_endpoint(auth: HTTPBasicCredentials = Depends(verify_credentials)):
     """
     Reset the database by clearing all trades and prices data.
     This must be called before uploading new files.
@@ -59,7 +85,7 @@ async def reset_database_endpoint():
 
 
 @app.get("/export/trades/")
-async def export_trades():
+async def export_trades(auth: HTTPBasicCredentials = Depends(verify_credentials)):
     """
     Export the entire trades table as JSON.
     Returns all trade data in the database.
@@ -84,6 +110,7 @@ async def export_trades():
 @app.post("/upload/")
 async def upload_files(
     background_tasks: BackgroundTasks,
+    auth: HTTPBasicCredentials = Depends(verify_credentials),
     files: List[UploadFile] = File(...)
 ):
     """
@@ -175,7 +202,7 @@ async def upload_files(
 
 
 @app.get("/portfolio-values/")
-async def get_portfolio_values():
+async def get_portfolio_values(auth: HTTPBasicCredentials = Depends(verify_credentials)):
     """
     Compute and return monthly net contributions and daily actual portfolio values using yfinance.
     """
@@ -241,7 +268,7 @@ async def get_portfolio_values():
 
 
 @app.get("/export/prices/")
-async def export_ticker_prices():
+async def export_ticker_prices(auth: HTTPBasicCredentials = Depends(verify_credentials)):
     """
     Export daily ticker prices for each ticker in both yfinance currency and target currency (GBP).
     Returns ticker prices data in JSON format.

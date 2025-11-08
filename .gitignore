@@ -24,4 +24,5 @@ ENV/
 db/
 
 trading_statements/
+Caddyfile
 
