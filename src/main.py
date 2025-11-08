@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+import concurrent.futures
 from fastapi import BackgroundTasks, FastAPI, File, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -190,15 +191,8 @@ async def get_portfolio_values():
 
         # Log sample CSV prices and currencies
         logger.info("=== DEBUG: Sample CSV Trade Data ===")
-        sample_trades = df.head(5) [
-            [
-                "Ticker",
-                "Trade Date/Time",
-                "Share Price",
-                "Total Trade Value",
-                "Transaction Type",
-            ]
-        ]
+        sample_columns = ["Ticker", "Trade Date/Time", "Share Price", "Total Trade Value", "Transaction Type"]
+        sample_trades = df[sample_columns].head(5)
         logger.info(sample_trades.to_string(index=False))
         logger.info("CSV prices are in GBP (from '£' removal in merge_csv.py)")
 
@@ -238,34 +232,35 @@ async def get_portfolio_values():
                 status_code=404,
             )
 
-        # Fetch currencies for all tickers
-        reported_currencies = {}
-        needed_fx = set()
-        for ticker in unique_tickers:
+        # Fetch currencies for all tickers in parallel
+        def get_currency(ticker):
             try:
                 yf_ticker = yf.Ticker(ticker)
                 reported = yf_ticker.info.get("currency", "Unknown")
+                return ticker, reported
+            except Exception as e:
+                logger.error(f"Error getting currency for {ticker}: {e}")
+                return ticker, "GBP"
+
+        reported_currencies = {}
+        needed_fx = set()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(get_currency, ticker) for ticker in unique_tickers]
+            for future in concurrent.futures.as_completed(futures):
+                ticker, reported = future.result()
                 reported_currencies[ticker] = reported
                 if reported != "Unknown" and reported != "GBP" and reported != "GBp":
                     needed_fx.add(reported)
                 logger.info(f"Ticker {ticker}: Reported={reported}")
-            except Exception as e:
-                logger.error(f"Error getting currency for {ticker}: {e}")
-                reported_currencies[ticker] = "GBP"
 
         # Log yfinance currencies for tickers
         logger.info("=== DEBUG: yfinance Currencies ===")
         for ticker in unique_tickers[:3]:  # Sample first 3
-            try:
-                yf_ticker = yf.Ticker(ticker)
-                currency = yf_ticker.info.get("currency", "Unknown")
-                logger.info(f"Ticker {ticker}: Currency = {currency}")
-            except Exception as e:
-                logger.error(f"Error getting currency for {ticker}: {e}")
+            currency = reported_currencies.get(ticker, "Unknown")
+            logger.info(f"Ticker {ticker}: Currency = {currency}")
 
-        # Compute common start date
-        common_start_dates = {}
-        for ticker in unique_tickers:
+        # Compute common start date in parallel
+        def get_min_hist_date(ticker):
             try:
                 yf_ticker = yf.Ticker(ticker)
                 hist = yf_ticker.history(period="max")
@@ -280,12 +275,23 @@ async def get_portfolio_values():
                     min_hist = (
                         hist_min.date() if hasattr(hist_min, "date") else hist_min
                     )
+                    return ticker, min_hist
+                else:
+                    return ticker, None
+            except Exception as e:
+                logger.error(f"Error getting min date for {ticker}: {e}")
+                return ticker, None
+
+        common_start_dates = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(get_min_hist_date, ticker) for ticker in unique_tickers]
+            for future in concurrent.futures.as_completed(futures):
+                ticker, min_hist = future.result()
+                if min_hist:
                     common_start_dates[ticker] = min_hist
                     logger.info(f"Min hist date for {ticker}: {min_hist}")
                 else:
                     logger.warning(f"No historical data for {ticker}")
-            except Exception as e:
-                logger.error(f"Error getting min date for {ticker}: {e}")
 
         if not common_start_dates:
             return JSONResponse(
@@ -330,7 +336,6 @@ async def get_portfolio_values():
 
         # Create prices table if not exists (now for converted GBP prices)
         conn = sqlite3.connect(db_path)
-        conn.execute("DROP TABLE IF EXISTS prices")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS prices (
                 ticker TEXT,
@@ -341,7 +346,7 @@ async def get_portfolio_values():
         """)
         conn.commit()
 
-        # Fetch FX rates for non-GBP currencies
+        # Fetch/cache FX rates for non-GBP currencies
         fx_config = {
             "USD": ("GBPUSD=X", False),  # divide by rate (USD/GBP)
             "EUR": ("EURGBP=X", True),   # multiply by rate (GBP/EUR)
@@ -351,44 +356,60 @@ async def get_portfolio_values():
         for curr in needed_fx:
             if curr in fx_config:
                 fx_ticker_str, multiply = fx_config[curr]
-                try:
-                    logger.info(f"Fetching FX for {curr}: {fx_ticker_str}")
-                    fx_ticker = yf.Ticker(fx_ticker_str)
-                    fx_hist = fx_ticker.history(
-                        start=common_start, end=max_date + pd.Timedelta(days=1)
-                    )
-                    if not fx_hist.empty:
-                        try:
-                            if fx_hist.index.tz is not None:
-                                fx_hist.index = fx_hist.index.tz_localize(None)
-                        except (AttributeError, TypeError):
-                            pass
-                        fx_close = (
-                            fx_hist["Close"].reindex(dates).ffill().fillna(1.0)
+                # Check cache for FX
+                cached_fx_query = f"""
+                    SELECT date, close FROM prices
+                    WHERE ticker = '{fx_ticker_str}' AND date BETWEEN '{common_start}' AND '{max_date}'
+                    ORDER BY date
+                """
+                cached_fx = pd.read_sql_query(cached_fx_query, conn)
+                if not cached_fx.empty:
+                    cached_fx["date"] = pd.to_datetime(cached_fx["date"]).dt.date
+                    cached_fx.set_index("date", inplace=True)
+                    date_list_fx = [d.date() for d in dates]
+                    cached_fx_prices = cached_fx.reindex(date_list_fx).ffill()["close"].fillna(1.0).values
+                    logger.info(f"Cached FX rates for {fx_ticker_str}")
+                    fx_data[curr] = {"rates": cached_fx_prices, "multiply": multiply}
+                else:
+                    try:
+                        logger.info(f"Fetching FX for {curr}: {fx_ticker_str}")
+                        fx_ticker = yf.Ticker(fx_ticker_str)
+                        fx_hist = fx_ticker.history(
+                            start=common_start, end=max_date + pd.Timedelta(days=1)
                         )
-                        fx_data[curr] = {"rates": fx_close.values, "multiply": multiply}
-                        logger.info(
-                            f"FX rates for {curr} fetched: {len(fx_close)} days, sample: {fx_close.values[:3]}"
-                        )
-                    else:
-                        logger.warning(f"No FX data for {curr}, assuming 1:1")
+                        if not fx_hist.empty:
+                            try:
+                                if fx_hist.index.tz is not None:
+                                    fx_hist.index = fx_hist.index.tz_localize(None)
+                            except (AttributeError, TypeError):
+                                pass
+                            fx_close = fx_hist["Close"].reindex(dates).ffill().fillna(1.0)
+                            # Cache FX rates
+                            for i in range(len(fx_close)):
+                                fx_val = fx_close.iloc[i]
+                                if pd.notna(fx_val) and fx_val > 0:
+                                    date_str = dates[i].strftime("%Y-%m-%d")
+                                    conn.execute(
+                                        "INSERT OR REPLACE INTO prices (ticker, date, close) VALUES (?, ?, ?)",
+                                        (fx_ticker_str, date_str, float(fx_val)),
+                                    )
+                            conn.commit()
+                            fx_data[curr] = {"rates": fx_close.values, "multiply": multiply}
+                            logger.info(
+                                f"FX rates for {curr} fetched and cached: {len(fx_close)} days, sample: {fx_close.values[:3]}"
+                            )
+                        else:
+                            logger.warning(f"No FX data for {curr}, assuming 1:1")
+                            fx_data[curr] = {"rates": np.ones(len(dates)), "multiply": multiply}
+                    except Exception as e:
+                        logger.error(f"Error fetching FX for {curr}: {e}, assuming 1:1")
                         fx_data[curr] = {"rates": np.ones(len(dates)), "multiply": multiply}
-                except Exception as e:
-                    logger.error(f"Error fetching FX for {curr}: {e}, assuming 1:1")
-                    fx_data[curr] = {"rates": np.ones(len(dates)), "multiply": multiply}
             else:
                 logger.warning(f"Unsupported currency {curr}, assuming prices in GBP")
         if not needed_fx:
             logger.info("All currencies are GBP or GBp, no FX needed")
 
-        logger.info(
-            f"DEBUG HOLDINGS: common_start = {common_start}, max_date = {max_date}, num_days = {len(dates)}"
-        )
-        logger.info(
-            f"DEBUG HOLDINGS: date range min {min([d.date() for d in dates])}, max {max([d.date() for d in dates])}"
-        )
-
-        # Simulate holdings for each ticker
+        # Simulate holdings for each ticker (reduced debug output)
         holdings_data = {}
         date_list = [d.date() for d in dates]
         for ticker in unique_tickers:
@@ -429,18 +450,13 @@ async def get_portfolio_values():
                 )
 
             # Build daily holdings by iterating through dates and accumulating (carries forward previous holding)
+            # Reduced logging: only summary, no per-adjustment details
             daily_holdings = pd.Series(index=dates, dtype=float)
             cum_qty = initial_qty
             for i, date in enumerate(dates):
                 adj_today = daily_adj.get(date.date(), 0.0)
-                if abs(adj_today) > 1e-6:  # Log only significant adjustments
-                    logger.info(
-                        f"DEBUG HOLDINGS [{ticker}]: On {date.date()} (idx {i}), adj={adj_today:.6f}, cum before={cum_qty:.6f}"
-                    )
                 cum_qty += adj_today
                 daily_holdings.iloc[i] = cum_qty
-                if abs(adj_today) > 1e-6:
-                    logger.info(f"DEBUG HOLDINGS [{ticker}]: Updated to cum={cum_qty:.6f}")
 
             # No NaNs or ffill needed; all days explicitly set with carry-forward
             logger.info(
@@ -454,172 +470,251 @@ async def get_portfolio_values():
             )
             holdings_data[ticker] = daily_holdings.values
 
-        # Fetch/cache prices, fetching full history and ffill for missing early data
-        price_data = {}
-        for ticker in unique_tickers:
-            # Check cached prices for the range
-            cached_query = f"""
-                SELECT date, close FROM prices
-                WHERE ticker = '{ticker}' AND date BETWEEN '{common_start}' AND '{max_date}'
-                ORDER BY date
-            """
-            cached = pd.read_sql_query(cached_query, conn)
-            if not cached.empty:
-                cached["date"] = pd.to_datetime(cached["date"]).dt.date
-                cached.set_index("date", inplace=True)
-                date_list = [d.date() for d in dates]
-                cached_prices = (
-                    cached.reindex(date_list).ffill()["close"].fillna(0.0).values
-                )
-                logger.info(
-                    f"Cached prices for {ticker}: non-zero count = {np.count_nonzero(np.array(cached_prices) > 0)} out of {len(cached_prices)}"
-                )
-            else:
-                cached_prices = np.zeros(len(dates))
-                logger.info(f"No cached prices for {ticker}")
+# Fetch/cache prices in parallel
+        def fetch_and_convert_history(ticker):
+            thread_conn = None
+            try:
+                thread_conn = sqlite3.connect(db_path)
+                cached_query = f"""
+                    SELECT date, close FROM prices
+                    WHERE ticker = '{ticker}' AND date BETWEEN '{common_start}' AND '{max_date}'
+                    ORDER BY date
+                """
+                cached = pd.read_sql_query(cached_query, thread_conn)
+                if not cached.empty:
+                    cached["date"] = pd.to_datetime(cached["date"]).dt.date
+                    cached.set_index("date", inplace=True)
+                    date_list = [d.date() for d in dates]
+                    cached_prices = cached.reindex(date_list).ffill()["close"].fillna(0.0).values
+                    logger.info(f"Cached prices for {ticker}: non-zero count = {np.count_nonzero(cached_prices > 0)} out of {len(cached_prices)}")
+                    if not np.any(cached_prices == 0.0):
+                        return ticker, cached_prices, True
+                else:
+                    cached_prices = np.zeros(len(dates))
+                    logger.info(f"No cached prices for {ticker}")
 
-            # If any missing (0.0), fetch full history
-            if np.any(np.array(cached_prices) == 0.0):
-                logger.info(
-                    f"Fetching history for {ticker} from {common_start} to {max_date}"
-                )
-                try:
+                if np.any(cached_prices == 0.0):
+                    logger.info(f"Fetching history for {ticker} from {common_start} to {max_date}")
                     yf_ticker = yf.Ticker(ticker)
-                    hist = yf_ticker.history(
-                        start=common_start, end=max_date + pd.Timedelta(days=1)
-                    )
+                    hist = yf_ticker.history(start=common_start, end=max_date + pd.Timedelta(days=1))
                     logger.info(f"Hist length for {ticker}: {len(hist)}")
-                    logger.info(
-                        f"Hist date range for {ticker}: {hist.index.min()} to {hist.index.max()}"
-                    )
-                    if len(hist) > 0:
-                        logger.info(
-                            f"Sample hist dates for {ticker}: {hist.index[:3].tolist() if len(hist) >= 3 else hist.index.tolist()}"
-                        )
-                        # Remove timezone from hist DataFrame to match naive dates
+                    if not hist.empty:
+                        logger.info(f"Hist date range for {ticker}: {hist.index.min()} to {hist.index.max()}")
                         try:
                             if hist.index.tz is not None:
                                 hist.index = hist.index.tz_localize(None)
                         except (AttributeError, TypeError):
                             pass
-
-                        # Always use Close price
                         prices = hist["Close"].reindex(dates).ffill().fillna(0.0)
 
-                        # Convert to GBP: for .L tickers, handle reported currency specially
                         reported = reported_currencies.get(ticker, "GBP")
                         converted_prices = prices.copy()
                         is_lse = ticker.endswith('.L')
-                        if is_lse:
-                            if reported == "GBp":
-                                converted_prices = prices / 100.0
-                                logger.info(f"Converted {ticker} (LSE, GBp) to GBP (divided by 100)")
-                            elif reported == "USD":
-                                # Convert USD to GBP even for LSE
-                                fx_info = fx_data.get("USD")
-                                if fx_info:
-                                    rates_series = pd.Series(fx_info["rates"], index=dates)
-                                    converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
-                                    logger.info(f"Converted {ticker} (LSE, reported USD) to GBP using FX rates")
+                        if is_lse and reported == "GBp":
+                            converted_prices = prices / 100.0
+                            logger.info(f"Converted {ticker} (LSE, GBp) to GBP (divided by 100)")
+                        elif reported == "USD":
+                            fx_info = fx_data.get("USD")
+                            if fx_info:
+                                rates_series = pd.Series(fx_info["rates"], index=dates)
+                                converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
+                                logger.info(f"Converted {ticker} (reported USD) to GBP using FX rates")
+                        elif reported != "GBP":
+                            fx_info = fx_data.get(reported)
+                            if fx_info:
+                                rates_series = pd.Series(fx_info["rates"], index=dates)
+                                if fx_info["multiply"]:
+                                    converted_prices = prices * rates_series.reindex(dates).ffill().fillna(1.0)
                                 else:
-                                    logger.info(f"No FX for USD on {ticker}, assuming already in GBP")
-                            else:
-                                logger.info(f"{ticker} (LSE, {reported}) assumed in GBP, no change")
-                        else:
-                            # Non-LSE: use reported
-                            if reported == "GBp":
-                                converted_prices = prices / 100.0
-                                logger.info(f"Converted {ticker} GBp to GBP (divided by 100)")
-                            elif reported == "USD":
-                                fx_info = fx_data.get("USD")
-                                if fx_info:
-                                    rates_series = pd.Series(fx_info["rates"], index=dates)
                                     converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
-                                    logger.info(f"Converted {ticker} USD to GBP using FX rates")
-                            elif reported != "GBP":
-                                # Handle other currencies if needed
-                                fx_info = fx_data.get(reported)
-                                if fx_info:
-                                    rates_series = pd.Series(fx_info["rates"], index=dates)
-                                    if fx_info["multiply"]:
-                                        converted_prices = prices * rates_series.reindex(dates).ffill().fillna(1.0)
-                                    else:
-                                        converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
-                                    logger.info(f"Converted {ticker} {reported} to GBP using FX rates")
-                                else:
-                                    logger.info(f"No FX info for {reported} on {ticker}, assuming already in GBP")
-                            else:
-                                logger.info(f"{ticker} ({reported}) assumed in GBP, no change")
+                                logger.info(f"Converted {ticker} {reported} to GBP using FX rates")
 
-                        # Replace any remaining NaN with 0
                         converted_prices = converted_prices.fillna(0.0)
-
                         non_zero = (converted_prices > 0).sum()
-                        logger.info(
-                            f"Non-zero converted prices for {ticker}: {non_zero} out of {len(converted_prices)}"
-                        )
+                        logger.info(f"Non-zero converted prices for {ticker}: {non_zero} out of {len(converted_prices)}")
+                        return ticker, converted_prices.values, False
+                    return ticker, np.zeros(len(dates)), False
+            except Exception as e:
+                logger.error(f"Exception in fetch_and_convert_history for {ticker}: {e}")
+                return ticker, np.zeros(len(dates)), True
+            finally:
+                if thread_conn:
+                    thread_conn.close()
 
-                        # Sample comparison with converted prices
-                        ticker_trades_sample = df[
-                            (df["Ticker"] == ticker) & (df["Transaction Type"] == "Buy")
-                        ].head(1)
-                        if (
-                            not ticker_trades_sample.empty
-                            and len(ticker_trades_sample) > 0
-                        ):
-                            sample_trade_date = (
-                                ticker_trades_sample["Trade Date/Time"].iloc[0].date()
-                            )
-                            sample_csv_price = ticker_trades_sample["Share Price"].iloc[
-                                0
-                            ]
-                            valid_dates = [
-                                d for d in dates if d.date() >= sample_trade_date
-                            ]
-                            if valid_dates:
-                                closest_date = min(
-                                    valid_dates,
-                                    key=lambda x: abs(
-                                        (x.date() - sample_trade_date).days
-                                    ),
-                                )
-                                price_idx = list(dates).index(closest_date)
-                                if isinstance(price_idx, int) and price_idx < len(
-                                    converted_prices
-                                ):
-                                    yf_converted = converted_prices.iloc[price_idx]
-                                    logger.info(
-                                        f"Sample comparison for {ticker} on ~{sample_trade_date}: CSV £{sample_csv_price:.2f} vs yf Converted GBP £{yf_converted:.2f}"
-                                    )
+        price_data = {}
+        to_cache = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(fetch_and_convert_history, ticker) for ticker in unique_tickers]
+            for future in concurrent.futures.as_completed(futures):
+                ticker, prices_arr, fully_cached = future.result()
+                price_data[ticker] = prices_arr
+                if not fully_cached:
+                    to_cache.append((ticker, prices_arr))
+
+        # Sample comparisons in main thread
+        for ticker in unique_tickers:
+            if ticker in price_data:
+                converted_prices = pd.Series(price_data[ticker], index=dates)
+                ticker_trades_sample = df[(df["Ticker"] == ticker) & (df["Transaction Type"] == "Buy")].head(1)
+                if not ticker_trades_sample.empty:
+                    sample_trade_date = ticker_trades_sample["Trade Date/Time"].iloc[0].date()
+                    sample_csv_price = ticker_trades_sample["Share Price"].iloc[0]
+                    valid_dates = [d for d in dates if d.date() >= sample_trade_date]
+                    if valid_dates:
+                        closest_date = min(valid_dates, key=lambda x: abs((x.date() - sample_trade_date).days))
+                        price_idx = list(dates).index(closest_date)
+                        if 0 <= price_idx < len(converted_prices):
+                            yf_converted = converted_prices.iloc[price_idx]
+                            logger.info(f"Sample comparison for {ticker} on ~{sample_trade_date}: CSV £{sample_csv_price:.2f} vs yf Converted GBP £{yf_converted:.2f}")
+
+        # Cache non-fully-cached prices using main conn
+        for ticker, prices in to_cache:
+            converted_prices = pd.Series(prices, index=dates)
+            for i in range(len(converted_prices)):
+                price_val = converted_prices.iloc[i]
+                if pd.notna(price_val) and price_val > 0:
+                    date_str = dates[i].strftime("%Y-%m-%d")
+                    conn.execute("INSERT OR REPLACE INTO prices (ticker, date, close) VALUES (?, ?, ?)", (ticker, date_str, float(price_val)))
+            logger.info(f"Cached prices for {ticker}")
+        conn.commit()
+        def fetch_and_convert_history(ticker):
+            thread_conn = None
+            try:
+                thread_conn = sqlite3.connect(db_path)
+                cached_query = f"""
+                    SELECT date, close FROM prices
+                    WHERE ticker = '{ticker}' AND date BETWEEN '{common_start}' AND '{max_date}'
+                    ORDER BY date
+                """
+                cached = pd.read_sql_query(cached_query, thread_conn)
+                if not cached.empty:
+                    cached["date"] = pd.to_datetime(cached["date"]).dt.date
+                    cached.set_index("date", inplace=True)
+                    date_list = [d.date() for d in dates]
+                    cached_prices = cached.reindex(date_list).ffill()["close"].fillna(0.0).values
+                    logger.info(f"Cached prices for {ticker}: non-zero count = {np.count_nonzero(cached_prices > 0)} out of {len(cached_prices)}")
+                    if not np.any(cached_prices == 0.0):
+                        return ticker, cached_prices, True
+                else:
+                    cached_prices = np.zeros(len(dates))
+                    logger.info(f"No cached prices for {ticker}")
+
+                if np.any(cached_prices == 0.0):
+                    logger.info(f"Fetching history for {ticker} from {common_start} to {max_date}")
+                    yf_ticker = yf.Ticker(ticker)
+                    hist = yf_ticker.history(start=common_start, end=max_date + pd.Timedelta(days=1))
+                    logger.info(f"Hist length for {ticker}: {len(hist)}")
+                    if not hist.empty:
+                        logger.info(f"Hist date range for {ticker}: {hist.index.min()} to {hist.index.max()}")
+                        try:
+                            if hist.index.tz is not None:
+                                hist.index = hist.index.tz_localize(None)
+                        except (AttributeError, TypeError):
+                            pass
+                        prices = hist["Close"].reindex(dates).ffill().fillna(0.0)
+
+                        reported = reported_currencies.get(ticker, "GBP")
+                        converted_prices = prices.copy()
+                        is_lse = ticker.endswith('.L')
+                        if is_lse and reported == "GBp":
+                            converted_prices = prices / 100.0
+                            logger.info(f"Converted {ticker} (LSE, GBp) to GBP (divided by 100)")
+                        elif reported == "USD":
+                            fx_info = fx_data.get("USD")
+                            if fx_info:
+                                rates_series = pd.Series(fx_info["rates"], index=dates)
+                                converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
+                                logger.info(f"Converted {ticker} (reported USD) to GBP using FX rates")
+                        elif reported != "GBP":
+                            fx_info = fx_data.get(reported)
+                            if fx_info:
+                                rates_series = pd.Series(fx_info["rates"], index=dates)
+                                if fx_info["multiply"]:
+                                    converted_prices = prices * rates_series.reindex(dates).ffill().fillna(1.0)
                                 else:
-                                    logger.info(
-                                        f"Invalid index for sample comparison for {ticker}"
-                                    )
+                                    converted_prices = prices / rates_series.reindex(dates).ffill().fillna(1.0)
+                                logger.info(f"Converted {ticker} {reported} to GBP using FX rates")
 
-                        # Cache converted GBP prices (only non-NaN >0)
-                        for i in range(len(converted_prices)):
-                            price_val = converted_prices.iloc[i]
-                            if pd.notna(price_val) and price_val > 0:
-                                date_str = dates[i].strftime("%Y-%m-%d")
-                                conn.execute(
-                                    "INSERT OR REPLACE INTO prices (ticker, date, close) VALUES (?, ?, ?)",
-                                    (ticker, date_str, float(price_val)),
-                                )
-                        conn.commit()
-                        price_data[ticker] = converted_prices.values
-                    else:
-                        logger.info(f"No historical data returned for {ticker}")
-                        price_data[ticker] = cached_prices
-                except Exception as e:
-                    logger.info(f"Exception fetching {ticker}: {e}")
-                    import traceback
+                        converted_prices = converted_prices.fillna(0.0)
+                        non_zero = (converted_prices > 0).sum()
+                        logger.info(f"Non-zero converted prices for {ticker}: {non_zero} out of {len(converted_prices)}")
+                        return ticker, converted_prices.values, False
+                    return ticker, np.zeros(len(dates)), False
+            except Exception as e:
+                logger.error(f"Exception in fetch_and_convert_history for {ticker}: {e}")
+                return ticker, np.zeros(len(dates)), True
+            finally:
+                if thread_conn:
+                    thread_conn.close()
 
-                    traceback.logger.info_exc()
-                    price_data[ticker] = cached_prices
-            else:
-                logger.info(f"All prices cached for {ticker}, using cache")
-                # Assume cached are already converted GBP
-                price_data[ticker] = cached_prices
+        price_data = {}
+        to_cache = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(fetch_and_convert_history, ticker) for ticker in unique_tickers]
+            for future in concurrent.futures.as_completed(futures):
+                ticker, prices_arr, fully_cached = future.result()
+                price_data[ticker] = prices_arr
+                if not fully_cached:
+                    to_cache.append((ticker, prices_arr))
+
+        # Sample comparisons in main thread
+        for ticker in unique_tickers:
+            if ticker in price_data:
+                converted_prices = pd.Series(price_data[ticker], index=dates)
+                ticker_trades_sample = df[(df["Ticker"] == ticker) & (df["Transaction Type"] == "Buy")].head(1)
+                if not ticker_trades_sample.empty:
+                    sample_trade_date = ticker_trades_sample["Trade Date/Time"].iloc[0].date()
+                    sample_csv_price = ticker_trades_sample["Share Price"].iloc[0]
+                    valid_dates = [d for d in dates if d.date() >= sample_trade_date]
+                    if valid_dates:
+                        closest_date = min(valid_dates, key=lambda x: abs((x.date() - sample_trade_date).days))
+                        price_idx = list(dates).index(closest_date)
+                        if 0 <= price_idx < len(converted_prices):
+                            yf_converted = converted_prices.iloc[price_idx]
+                            logger.info(f"Sample comparison for {ticker} on ~{sample_trade_date}: CSV £{sample_csv_price:.2f} vs yf Converted GBP £{yf_converted:.2f}")
+
+        # Cache non-fully-cached prices using main conn
+        for ticker, prices in to_cache:
+            converted_prices = pd.Series(prices, index=dates)
+            for i in range(len(converted_prices)):
+                price_val = converted_prices.iloc[i]
+                if pd.notna(price_val) and price_val > 0:
+                    date_str = dates[i].strftime("%Y-%m-%d")
+                    conn.execute("INSERT OR REPLACE INTO prices (ticker, date, close) VALUES (?, ?, ?)", (ticker, date_str, float(price_val)))
+            logger.info(f"Cached prices for {ticker}")
+        conn.commit()
+
+        # Move sample comparisons to main thread (now that prices are fetched)
+        for ticker in unique_tickers:
+            if ticker in price_data:
+                converted_prices = pd.Series(price_data[ticker], index=dates)
+                ticker_trades_sample = df[
+                    (df["Ticker"] == ticker) & (df["Transaction Type"] == "Buy")
+                ].head(1)
+                if not ticker_trades_sample.empty:
+                    sample_trade_date = ticker_trades_sample["Trade Date/Time"].iloc[0].date()
+                    sample_csv_price = ticker_trades_sample["Share Price"].iloc[0]
+                    valid_dates = [d for d in dates if d.date() >= sample_trade_date]
+                    if valid_dates:
+                        closest_date = min(valid_dates, key=lambda x: abs((x.date() - sample_trade_date).days))
+                        price_idx = list(dates).index(closest_date)
+                        if 0 <= price_idx < len(converted_prices):
+                            yf_converted = converted_prices.iloc[price_idx]
+                            logger.info(f"Sample comparison for {ticker} on ~{sample_trade_date}: CSV £{sample_csv_price:.2f} vs yf Converted GBP £{yf_converted:.2f}")
+
+        # Cache non-fully-cached prices
+        for ticker, prices in to_cache:
+            converted_prices = pd.Series(prices, index=dates)
+            for i in range(len(converted_prices)):
+                price_val = converted_prices.iloc[i]
+                if pd.notna(price_val) and price_val > 0:
+                    date_str = dates[i].strftime("%Y-%m-%d")
+                    conn.execute(
+                        "INSERT OR REPLACE INTO prices (ticker, date, close) VALUES (?, ?, ?)",
+                        (ticker, date_str, float(price_val)),
+                    )
+            conn.commit()
+            logger.info(f"Cached prices for {ticker}")
 
         conn.close()
 
