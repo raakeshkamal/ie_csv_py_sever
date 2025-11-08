@@ -71,6 +71,9 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         conn = get_connection(db_path)
         close_conn = True
 
+    # Ensure tables exist first
+    create_precomputed_tables(conn, db_path)
+
     # Insert status record
     status_id = None
     try:
@@ -80,9 +83,6 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         )
         status_id = cursor.lastrowid
         conn.commit()
-
-        # Ensure tables exist
-        create_precomputed_tables(conn, db_path)
 
         # Prepare data
         df = df.copy()
@@ -284,6 +284,9 @@ def export_precomputed_data(db_path: Optional[str] = None):
 
     conn = get_connection(db_path)
     try:
+        # Ensure tables exist to avoid errors
+        create_precomputed_tables(conn, db_path)
+
         # Get portfolio values
         portfolio_df = pd.read_sql_query(
             "SELECT date, daily_value, last_updated FROM precomputed_portfolio_values ORDER BY date",

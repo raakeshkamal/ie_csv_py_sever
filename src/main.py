@@ -182,9 +182,20 @@ async def get_portfolio_values():
     logger.info("Endpoint /portfolio-values/ called")
 
     try:
-        # Load trades from database
-        df = load_trades()
+        # Try to get precomputed data first (faster)
+        result = get_precomputed_portfolio_data()
 
+        if result is not None:
+            # Return precomputed data if available
+            return JSONResponse(
+                content={
+                    "success": True,
+                    **result
+                }
+            )
+
+        # If no precomputed data, check for trades
+        df = load_trades()
         logger.info(f"Loaded {len(df)} trades from database")
 
         if df.empty:
@@ -199,22 +210,18 @@ async def get_portfolio_values():
         # Ensure prices table exists
         create_prices_table()
 
-        # Try to get precomputed data first (faster)
-        result = get_precomputed_portfolio_data()
+        # Fallback to live calculation if precomputed data not available
+        logger.warning("Precomputed data not available, falling back to live calculation...")
+        result = calculate_portfolio_values(df)
 
         if result is None:
-            # Fallback to live calculation if precomputed data not available
-            logger.warning("Precomputed data not available, falling back to live calculation...")
-            result = calculate_portfolio_values(df)
-
-            if result is None:
-                return JSONResponse(
-                    content={
-                        "success": False,
-                        "error": "Failed to calculate portfolio values"
-                    },
-                    status_code=500,
-                )
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "error": "Failed to calculate portfolio values"
+                },
+                status_code=500,
+            )
 
         return JSONResponse(
             content={

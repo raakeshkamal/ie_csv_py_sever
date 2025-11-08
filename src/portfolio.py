@@ -134,7 +134,7 @@ def compute_daily_portfolio_values(
 
 def get_valid_unique_tickers(df) -> List[str]:
     """Get list of unique valid tickers from the dataframe."""
-    return df.loc[df["Ticker"] != "Not found", "Ticker"].drop_duplicates().tolist()
+    return df.loc[(df["Ticker"] != "Not found") & (df["Ticker"].notna()), "Ticker"].drop_duplicates().tolist()
 
 
 def calculate_portfolio_values(df) -> Optional[Dict]:

@@ -668,3 +668,587 @@ Vanguard FTSE 250 / ISIN IE00BYYHSQ67,Buy,5,£30.41,£152.05,01/11/24 12:45:32,0
 
             # Should be able to upload after concurrent operations
             client.post("/reset/")
+
+
+@pytest.mark.integration
+class TestExportPricesEndpoint:
+    """Tests for /export/prices/ endpoint."""
+
+    def test_export_prices_empty_database(self):
+        """Test exporting prices when database is empty."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_db:
+            tmp_db_path = tmp_db.name
+
+        with patch.object(src.database, 'DB_PATH', tmp_db_path):
+            client = TestClient(app)
+
+            response = client.get("/export/prices/")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is True
+            assert "portfolio_values" in data
+            assert "monthly_contributions" in data
+            assert "status" in data
+            assert "count" in data
+            assert data["count"]["portfolio_values"] == 0
+            assert data["count"]["monthly_contributions"] == 0
+
+    def test_export_prices_with_data(self):
+        """Test exporting prices when precomputed data exists."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_db:
+            tmp_db_path = tmp_db.name
+
+        with patch.object(src.database, 'DB_PATH', tmp_db_path):
+            client = TestClient(app)
+
+            # Upload trades first
+            csv_content = """Trading Statement,
+Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
+Vanguard FTSE 250 / ISIN IE00BYYHSQ67,Buy,5,£30.41,£152.05,01/11/24 12:45:32,05/11/24,InvestEngine
+iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,06/11/24,InvestEngine
+"""
+            file_content = BytesIO(csv_content.encode('utf-8'))
+
+            with patch('yfinance.Ticker') as mock_ticker_class:
+                # Mock ticker for info
+                mock_ticker_info = MagicMock()
+                mock_ticker_info.info = {'currency': 'GBP'}
+
+                # Mock ticker for history
+                mock_ticker_hist = MagicMock()
+                dates = pd.date_range('2024-11-01', '2024-12-01', freq='D')
+                prices = [31.0 + i * 0.1 for i in range(len(dates))]
+                mock_hist_df = pd.DataFrame({'Close': prices}, index=dates)
+                mock_ticker_hist.history.return_value = mock_hist_df
+
+                def create_ticker(ticker_str):
+                    if 'currency' in str(ticker_str):
+                        return mock_ticker_info
+                    return mock_ticker_hist
+
+                mock_ticker_class.side_effect = create_ticker
+
+                with patch('requests.get') as mock_requests:
+                    mock_response = MagicMock()
+                    mock_response.json.return_value = {
+                        "quotes": [{"symbol": "VUSA.L", "exchange": "LSE", "quoteType": "ETF"}]
+                    }
+                    mock_requests.return_value = mock_response
+
+                    upload_response = client.post(
+                        "/upload/",
+                        files={"files": ("trades.csv", file_content, "text/csv")}
+                    )
+
+                    assert upload_response.status_code == 200
+
+            # Get export response
+            response = client.get("/export/prices/")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is True
+
+            # Verify structure
+            assert "portfolio_values" in data
+            assert "monthly_contributions" in data
+            assert "status" in data
+            assert "count" in data
+
+            # Should have data
+            assert data["count"]["portfolio_values"] > 0
+            assert data["count"]["monthly_contributions"] == 1
+
+            # Verify portfolio values have correct structure
+            pv = data["portfolio_values"][0]
+            assert "date" in pv
+            assert "daily_value" in pv
+            assert "last_updated" in pv
+
+            # Verify monthly contributions have correct structure
+            mc = data["monthly_contributions"][0]
+            assert "month" in mc
+            assert "net_value" in mc
+            assert "last_updated" in mc
+
+            # Verify status structure
+            status = data["status"]
+            assert "status" in status
+            assert "has_data" in status
+            assert status["status"] == "completed"
+
+    def test_export_prices_format(self):
+        """Test that export prices format is correct."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_db:
+            tmp_db_path = tmp_db.name
+
+        with patch.object(src.database, 'DB_PATH', tmp_db_path):
+            client = TestClient(app)
+
+            # Insert precomputed data directly
+            import sqlite3
+            import datetime
+            conn = sqlite3.connect(tmp_db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS precomputed_portfolio_values (
+                    date DATE PRIMARY KEY,
+                    daily_value REAL,
+                    last_updated TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS precomputed_monthly_contributions (
+                    month TEXT PRIMARY KEY,
+                    net_value REAL,
+                    last_updated TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS precompute_status (
+                    id INTEGER PRIMARY KEY,
+                    status TEXT,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    total_tickers INTEGER,
+                    last_error TEXT
+                )
+            """)
+
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute("""
+                INSERT INTO precomputed_portfolio_values (date, daily_value, last_updated)
+                VALUES (?, ?, ?), (?, ?, ?)
+            """, ("2024-12-01", 152.05, now, "2024-12-02", 162.05, now))
+            conn.execute("""
+                INSERT INTO precomputed_monthly_contributions (month, net_value, last_updated)
+                VALUES (?, ?, ?)
+            """, ("2024-12", 1000.0, now))
+            conn.execute("""
+                INSERT INTO precompute_status (status, started_at, completed_at, total_tickers)
+                VALUES (?, ?, ?, ?)
+            """, ("completed", datetime.datetime.now(), datetime.datetime.now(), 2))
+            conn.commit()
+            conn.close()
+
+            response = client.get("/export/prices/")
+
+            assert response.status_code == 200
+            data = response.json()
+
+            # Verify all data is present
+            assert len(data["portfolio_values"]) == 2
+            assert len(data["monthly_contributions"]) == 1
+
+            # Verify correct ordering (should be sorted by date/month)
+            dates = [pv["date"] for pv in data["portfolio_values"]]
+            assert dates[0] < dates[1]
+
+            # Verify values
+            assert data["portfolio_values"][0]["daily_value"] == 152.05
+            assert data["portfolio_values"][1]["daily_value"] == 162.05
+            assert data["monthly_contributions"][0]["month"] == "2024-12"
+            assert data["monthly_contributions"][0]["net_value"] == 1000.0
+
+
+@pytest.mark.integration
+class TestBackgroundProcessingWorkflow:
+    """Integration tests for background processing workflow."""
+
+    def test_upload_triggers_background_processing(self):
+        """Test that upload triggers background processing and precomputed data is stored."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_db:
+            tmp_db_path = tmp_db.name
+
+        with patch.object(src.database, 'DB_PATH', tmp_db_path):
+            client = TestClient(app)
+
+            # Reset first
+            client.post("/reset/")
+
+            # Upload trades
+            csv_content = """Trading Statement,
+Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
+Vanguard FTSE 250 / ISIN IE00BYYHSQ67,Buy,5,£30.41,£152.05,01/11/24 12:45:32,05/11/24,InvestEngine
+iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,06/11/24,InvestEngine
+"""
+            file_content = BytesIO(csv_content.encode('utf-8'))
+
+            with patch('yfinance.Ticker') as mock_ticker_class:
+                with patch('requests.get') as mock_requests:
+                    # Mock ticker info
+                    mock_ticker_info = MagicMock()
+                    mock_ticker_info.info = {'currency': 'GBP'}
+
+                    # Mock ticker history
+                    mock_ticker_hist = MagicMock()
+                    dates = pd.date_range('2024-11-01', '2024-12-01', freq='D')
+                    prices = [31.0 + i * 0.1 for i in range(len(dates))]
+                    mock_hist_df = pd.DataFrame({'Close': prices}, index=dates)
+                    mock_ticker_hist.history.return_value = mock_hist_df
+
+                    def create_ticker(ticker_str):
+                        if 'currency' in str(ticker_str):
+                            return mock_ticker_info
+                        return mock_ticker_hist
+
+                    mock_ticker_class.side_effect = create_ticker
+
+                    mock_response = MagicMock()
+                    mock_response.json.return_value = {
+                        "quotes": [{"symbol": "VUSA.L", "exchange": "LSE", "quoteType": "ETF"}]
+                    }
+                    mock_requests.return_value = mock_response
+
+                    # Upload - this triggers background processing
+                    upload_response = client.post(
+                        "/upload/",
+                        files={"files": ("trades.csv", file_content, "text/csv")}
+                    )
+
+                    assert upload_response.status_code == 200
+
+                    # Simulate waiting for background processing by directly calling the function
+                    # Note: In real scenario, this would run in background
+                    from src.background_processor import precompute_portfolio_data
+                    from src.database import load_trades
+                    df = load_trades(db_path=tmp_db_path)
+                    if not df.empty:
+                        precompute_portfolio_data(df, db_path=tmp_db_path)
+
+            # Verify precomputed tables have data
+            import sqlite3
+            conn = sqlite3.connect(tmp_db_path)
+            cursor = conn.execute("SELECT COUNT(*) FROM precomputed_portfolio_values")
+            pv_count = cursor.fetchone()[0]
+            cursor = conn.execute("SELECT COUNT(*) FROM precomputed_monthly_contributions")
+            mc_count = cursor.fetchone()[0]
+            cursor = conn.execute("SELECT status FROM precompute_status")
+            status = cursor.fetchone()[0]
+            conn.close()
+
+            assert pv_count > 0, "Precomputed portfolio values should be stored"
+            assert mc_count > 0, "Precomputed monthly contributions should be stored"
+            assert status == "completed", "Status should be completed"
+
+    def test_portfolio_values_uses_precomputed_data_when_available(self):
+        """Test that portfolio-values endpoint returns precomputed data when available and fresh."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_db:
+            tmp_db_path = tmp_db.name
+
+        with patch.object(src.database, 'DB_PATH', tmp_db_path):
+            client = TestClient(app)
+
+            # Reset and create tables
+            client.post("/reset/")
+
+            # Insert precomputed data directly
+            import sqlite3
+            import datetime
+            conn = sqlite3.connect(tmp_db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS precomputed_portfolio_values (
+                    date DATE PRIMARY KEY,
+                    daily_value REAL,
+                    last_updated TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS precomputed_monthly_contributions (
+                    month TEXT PRIMARY KEY,
+                    net_value REAL,
+                    last_updated TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS precompute_status (
+                    id INTEGER PRIMARY KEY,
+                    status TEXT,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    total_tickers INTEGER,
+                    last_error TEXT
+                )
+            """)
+
+            # Insert fresh data (within last hour)
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute("""
+                INSERT INTO precomputed_portfolio_values (date, daily_value, last_updated)
+                VALUES (?, ?, ?), (?, ?, ?)
+            """, ("2024-12-01", 152.05, now, "2024-12-02", 162.05, now))
+            conn.execute("""
+                INSERT INTO precomputed_monthly_contributions (month, net_value, last_updated)
+                VALUES (?, ?, ?)
+            """, ("2024-12", 1000.0, now))
+            conn.commit()
+            conn.close()
+
+            # Mock trades table
+            with patch('src.database.load_trades') as mock_load:
+                mock_load.return_value = pd.DataFrame({
+                    'Security / ISIN': [],
+                    'Transaction Type': [],
+                    'Quantity': [],
+                    'Share Price': [],
+                    'Total Trade Value': [],
+                    'Trade Date/Time': [],
+                    'Ticker': []
+                })
+
+                # Get portfolio values
+                response = client.get("/portfolio-values/")
+
+                assert response.status_code == 200
+                data = response.json()
+                assert data["success"] is True
+
+                # Should have the precomputed data
+                assert len(data["daily_dates"]) == 2
+                assert data["daily_values"] == [152.05, 162.05]
+                assert len(data["monthly_net"]) == 1
+                assert data["monthly_net"][0]["Net_Value"] == 1000.0
+
+    def test_portfolio_values_falls_back_to_live_calculation_when_data_stale(self):
+        """Test that portfolio-values endpoint falls back to live calculation when precomputed data is stale."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_db:
+            tmp_db_path = tmp_db.name
+
+        with patch.object(src.database, 'DB_PATH', tmp_db_path):
+            client = TestClient(app)
+
+            # Reset and create tables
+            client.post("/reset/")
+
+            # Insert stale data (older than 24 hours)
+            import sqlite3
+            import datetime
+            conn = sqlite3.connect(tmp_db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS precomputed_portfolio_values (
+                    date DATE PRIMARY KEY,
+                    daily_value REAL,
+                    last_updated TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS precomputed_monthly_contributions (
+                    month TEXT PRIMARY KEY,
+                    net_value REAL,
+                    last_updated TIMESTAMP
+                )
+            """)
+
+            # Insert stale data (2 days old)
+            old_date = (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute("""
+                INSERT INTO precomputed_portfolio_values (date, daily_value, last_updated)
+                VALUES (?, ?, ?)
+            """, ("2024-12-01", 152.05, old_date))
+            conn.commit()
+            conn.close()
+
+            # Upload real trades
+            csv_content = """Trading Statement,
+Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
+Vanguard FTSE 250 / ISIN IE00BYYHSQ67,Buy,5,£30.41,£152.05,01/11/24 12:45:32,05/11/24,InvestEngine
+"""
+            file_content = BytesIO(csv_content.encode('utf-8'))
+
+            with patch('yfinance.Ticker') as mock_ticker_class:
+                # Mock ticker info
+                mock_ticker_info = MagicMock()
+                mock_ticker_info.info = {'currency': 'GBP'}
+
+                # Mock ticker history
+                mock_ticker_hist = MagicMock()
+                dates = pd.date_range('2024-11-01', '2025-12-15', freq='D')
+                prices = [100.0 + i * 0.5 for i in range(len(dates))]
+                mock_hist_df = pd.DataFrame({'Close': prices}, index=dates)
+                mock_ticker_hist.history.return_value = mock_hist_df
+
+                def create_ticker(ticker_str):
+                    if 'currency' in str(ticker_str):
+                        return mock_ticker_info
+                    return mock_ticker_hist
+
+                mock_ticker_class.side_effect = create_ticker
+
+                with patch('requests.get') as mock_requests:
+                    mock_response = MagicMock()
+                    mock_response.json.return_value = {
+                        "quotes": [{"symbol": "VUSA.L", "exchange": "LSE", "quoteType": "ETF"}]
+                    }
+                    mock_requests.return_value = mock_response
+
+                    upload_response = client.post(
+                        "/upload/",
+                        files={"files": ("trades.csv", file_content, "text/csv")}
+                    )
+
+                    assert upload_response.status_code == 200
+
+                    # Get portfolio values - should fall back to live calculation
+                    response = client.get("/portfolio-values/")
+
+                    assert response.status_code == 200
+                    data = response.json()
+                    assert data["success"] is True
+
+                    # Should have fresh portfolio values (not the stale 152.05)
+                    assert len(data["daily_values"]) > 1
+
+    def test_full_workflow_upload_portfolio_export(self):
+        """Test the complete workflow: upload → get portfolio → export prices."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_db:
+            tmp_db_path = tmp_db.name
+
+        with patch.object(src.database, 'DB_PATH', tmp_db_path):
+            client = TestClient(app)
+
+            # Reset
+            reset_response = client.post("/reset/")
+            assert reset_response.status_code == 200
+
+            # Upload trades
+            csv_content = """Trading Statement,
+Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
+Vanguard FTSE 250 / ISIN IE00BYYHSQ67,Buy,5,£30.41,£152.05,01/11/24 12:45:32,05/11/24,InvestEngine
+iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,06/11/24,InvestEngine
+"""
+            file_content = BytesIO(csv_content.encode('utf-8'))
+
+            with patch('yfinance.Ticker') as mock_ticker_class:
+                with patch('requests.get') as mock_requests:
+                    mock_ticker_info = MagicMock()
+                    mock_ticker_info.info = {'currency': 'GBP'}
+
+                    mock_ticker_hist = MagicMock()
+                    dates = pd.date_range('2024-11-01', '2024-12-01', freq='D')
+                    prices = [31.0 + i * 0.1 for i in range(len(dates))]
+                    mock_hist_df = pd.DataFrame({'Close': prices}, index=dates)
+                    mock_ticker_hist.history.return_value = mock_hist_df
+
+                    def create_ticker(ticker_str):
+                        if 'currency' in str(ticker_str):
+                            return mock_ticker_info
+                        return mock_ticker_hist
+
+                    mock_ticker_class.side_effect = create_ticker
+
+                    mock_response = MagicMock()
+                    mock_response.json.return_value = {
+                        "quotes": [{"symbol": "VUSA.L", "exchange": "LSE", "quoteType": "ETF"}]
+                    }
+                    mock_requests.return_value = mock_response
+
+                    upload_response = client.post(
+                        "/upload/",
+                        files={"files": ("trades.csv", file_content, "text/csv")}
+                    )
+
+                    assert upload_response.status_code == 200
+
+                    # Simulate background processing
+                    from src.background_processor import precompute_portfolio_data
+                    from src.database import load_trades
+                    df = load_trades(db_path=tmp_db_path)
+                    if not df.empty:
+                        precompute_portfolio_data(df, db_path=tmp_db_path)
+
+            # Get portfolio values
+            portfolio_response = client.get("/portfolio-values/")
+            assert portfolio_response.status_code == 200
+            portfolio_data = portfolio_response.json()
+            assert portfolio_data["success"] is True
+            assert "daily_dates" in portfolio_data
+            assert "daily_values" in portfolio_data
+            assert "monthly_net" in portfolio_data
+
+            # Export prices
+            export_response = client.get("/export/prices/")
+            assert export_response.status_code == 200
+            export_data = export_response.json()
+            assert export_data["success"] is True
+            assert "portfolio_values" in export_data
+            assert "monthly_contributions" in export_data
+            assert "status" in export_data
+            assert "count" in export_data
+
+            # Verify data consistency between endpoints
+            assert len(portfolio_data["daily_dates"]) == len(export_data["portfolio_values"])
+            assert len(portfolio_data["monthly_net"]) == len(export_data["monthly_contributions"])
+
+    def test_portfolio_values_endpoint_no_precomputed_data(self):
+        """Test portfolio-values when no precomputed data exists (falls back to live calculation)."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_db:
+            tmp_db_path = tmp_db.name
+
+        with patch.object(src.database, 'DB_PATH', tmp_db_path):
+            client = TestClient(app)
+
+            # Reset (creates tables but they're empty)
+            client.post("/reset/")
+
+            # Upload trades
+            csv_content = """Trading Statement,
+Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
+Vanguard FTSE 250 / ISIN IE00BYYHSQ67,Buy,5,£30.41,£152.05,01/11/24 12:45:32,05/11/24,InvestEngine
+"""
+            file_content = BytesIO(csv_content.encode('utf-8'))
+
+            with patch('yfinance.Ticker') as mock_ticker_class:
+                with patch('requests.get') as mock_requests:
+                    mock_ticker_info = MagicMock()
+                    mock_ticker_info.info = {'currency': 'GBP'}
+
+                    mock_ticker_hist = MagicMock()
+                    dates = pd.date_range('2024-11-01', '2024-12-01', freq='D')
+                    prices = [100.0 + i * 0.5 for i in range(len(dates))]
+                    mock_hist_df = pd.DataFrame({'Close': prices}, index=dates)
+                    mock_ticker_hist.history.return_value = mock_hist_df
+
+                    def create_ticker(ticker_str):
+                        if 'currency' in str(ticker_str):
+                            return mock_ticker_info
+                        return mock_ticker_hist
+
+                    mock_ticker_class.side_effect = create_ticker
+
+                    mock_response = MagicMock()
+                    mock_response.json.return_value = {
+                        "quotes": [{"symbol": "VUSA.L", "exchange": "LSE", "quoteType": "ETF"}]
+                    }
+                    mock_requests.return_value = mock_response
+
+                    upload_response = client.post(
+                        "/upload/",
+                        files={"files": ("trades.csv", file_content, "text/csv")}
+                    )
+                    assert upload_response.status_code == 200
+
+            # Get portfolio values without precomputing
+            with patch('yfinance.Ticker') as mock_ticker_class:
+                mock_ticker_info = MagicMock()
+                mock_ticker_info.info = {'currency': 'GBP'}
+
+                mock_ticker_hist = MagicMock()
+                dates = pd.date_range('2024-11-01', '2024-12-01', freq='D')
+                prices = [100.0 + i * 0.5 for i in range(len(dates))]
+                mock_hist_df = pd.DataFrame({'Close': prices}, index=dates)
+                mock_ticker_hist.history.return_value = mock_hist_df
+
+                def create_ticker(ticker_str):
+                    if 'currency' in str(ticker_str):
+                        return mock_ticker_info
+                    return mock_ticker_hist
+
+                mock_ticker_class.side_effect = create_ticker
+
+                response = client.get("/portfolio-values/")
+                assert response.status_code == 200
+                data = response.json()
+                assert data["success"] is True
+                # Should have daily values from live calculation
+                assert len(data["daily_dates"]) > 0
+

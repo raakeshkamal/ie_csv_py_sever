@@ -53,6 +53,12 @@ from src.portfolio import (
     get_valid_unique_tickers,
     calculate_portfolio_values
 )
+from src.background_processor import (
+    create_precomputed_tables,
+    precompute_portfolio_data,
+    get_precomputed_portfolio_data,
+    export_precomputed_data
+)
 
 
 @pytest.fixture

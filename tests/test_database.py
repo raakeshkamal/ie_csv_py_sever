@@ -25,6 +25,7 @@ from src.database import (
     cache_price,
     get_cached_prices
 )
+from src.background_processor import create_precomputed_tables
 
 
 @pytest.mark.unit
@@ -347,3 +348,175 @@ class TestPriceCaching:
 
         assert len(cached) == 1
         assert cached.iloc[0]['close'] == 100.0
+
+
+@pytest.mark.unit
+class TestPrecomputedTables:
+    """Tests for precomputed database tables."""
+
+    def test_create_precomputed_tables(self, temp_db_path):
+        """Test creating precomputed tables."""
+        create_precomputed_tables(db_path=temp_db_path)
+
+        conn = sqlite3.connect(temp_db_path)
+        cursor = conn.cursor()
+
+        # Check all tables exist
+        cursor.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name IN (
+                'precomputed_portfolio_values',
+                'precomputed_monthly_contributions',
+                'precompute_status'
+            )
+        """)
+        tables = [row[0] for row in cursor.fetchall()]
+
+        assert 'precomputed_portfolio_values' in tables
+        assert 'precomputed_monthly_contributions' in tables
+        assert 'precompute_status' in tables
+        conn.close()
+
+    def test_reset_database_drops_precomputed_tables(self, temp_db_path):
+        """Test that reset drops precomputed tables too."""
+        # Create tables
+        create_precomputed_tables(db_path=temp_db_path)
+        conn = sqlite3.connect(temp_db_path)
+        conn.execute("INSERT INTO precomputed_portfolio_values (date, daily_value) VALUES ('2024-01-01', 1000.0)")
+        conn.commit()
+        conn.close()
+
+        # Reset database
+        reset_database(temp_db_path)
+
+        # Verify tables are gone
+        conn = sqlite3.connect(temp_db_path)
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
+        conn.close()
+
+        assert 'precomputed_portfolio_values' not in tables
+        assert 'precomputed_monthly_contributions' not in tables
+        assert 'precompute_status' not in tables
+
+    def test_precomputed_portfolio_values_structure(self, temp_db_path):
+        """Test precomputed_portfolio_values table structure."""
+        create_precomputed_tables(db_path=temp_db_path)
+
+        conn = sqlite3.connect(temp_db_path)
+        cursor = conn.execute("""
+            INSERT INTO precomputed_portfolio_values (date, daily_value, last_updated)
+            VALUES ('2024-01-01', 1000.0, '2024-01-01 12:00:00')
+        """)
+        conn.commit()
+
+        # Verify data was stored
+        result = conn.execute("SELECT date, daily_value, last_updated FROM precomputed_portfolio_values").fetchone()
+        conn.close()
+
+        assert result[0] == '2024-01-01'
+        assert result[1] == 1000.0
+
+    def test_precomputed_monthly_contributions_structure(self, temp_db_path):
+        """Test precomputed_monthly_contributions table structure."""
+        create_precomputed_tables(db_path=temp_db_path)
+
+        conn = sqlite3.connect(temp_db_path)
+        cursor = conn.execute("""
+            INSERT INTO precomputed_monthly_contributions (month, net_value, last_updated)
+            VALUES ('2024-01', 1000.0, '2024-01-01 12:00:00')
+        """)
+        conn.commit()
+
+        # Verify data was stored
+        result = conn.execute("SELECT month, net_value, last_updated FROM precomputed_monthly_contributions").fetchone()
+        conn.close()
+
+        assert result[0] == '2024-01'
+        assert result[1] == 1000.0
+
+    def test_precompute_status_structure(self, temp_db_path):
+        """Test precompute_status table structure."""
+        create_precomputed_tables(db_path=temp_db_path)
+
+        conn = sqlite3.connect(temp_db_path)
+        now = datetime.now()
+        cursor = conn.execute("""
+            INSERT INTO precompute_status (status, started_at, total_tickers, last_error)
+            VALUES ('in_progress', ?, 5, 'test error')
+        """, (now,))
+        conn.commit()
+
+        # Verify data was stored
+        result = conn.execute("SELECT status, total_tickers, last_error FROM precompute_status").fetchone()
+        conn.close()
+
+        assert result[0] == 'in_progress'
+        assert result[1] == 5
+        assert result[2] == 'test error'
+
+    def test_precompute_status_tracks_completion(self, temp_db_path):
+        """Test that precompute_status tracks job completion."""
+        create_precomputed_tables(db_path=temp_db_path)
+
+        conn = sqlite3.connect(temp_db_path)
+        started = datetime.now()
+
+        # Insert in_progress
+        cursor = conn.execute("""
+            INSERT INTO precompute_status (status, started_at, total_tickers)
+            VALUES ('in_progress', ?, 2)
+        """, (started,))
+        conn.commit()
+
+        # Update to completed
+        cursor = conn.execute("""
+            UPDATE precompute_status
+            SET status = ?, completed_at = ?
+            WHERE status = 'in_progress'
+        """, ('completed', datetime.now()))
+        conn.commit()
+
+        # Verify status
+        result = conn.execute("SELECT status, started_at, completed_at FROM precompute_status").fetchone()
+        conn.close()
+
+        assert result[0] == 'completed'
+        assert result[1] is not None
+        assert result[2] is not None  # completed_at should be set
+
+    def test_precomputed_tables_primary_keys(self, temp_db_path):
+        """Test that precomputed tables enforce primary key constraints."""
+        create_precomputed_tables(db_path=temp_db_path)
+
+        conn = sqlite3.connect(temp_db_path)
+
+        # Insert data
+        conn.execute("INSERT INTO precomputed_portfolio_values (date, daily_value) VALUES ('2024-01-01', 1000.0)")
+        conn.commit()
+
+        # Try to insert duplicate (should fail)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO precomputed_portfolio_values (date, daily_value) VALUES ('2024-01-01', 2000.0)")
+            conn.commit()
+
+        conn.close()
+
+    def test_precomputed_tables_null_constraints(self, temp_db_path):
+        """Test that precomputed tables handle null values properly."""
+        create_precomputed_tables(db_path=temp_db_path)
+
+        conn = sqlite3.connect(temp_db_path)
+
+        # Should be able to insert with only required fields
+        conn.execute("INSERT INTO precomputed_portfolio_values (date, daily_value) VALUES ('2024-01-01', 1000.0)")
+        conn.commit()
+
+        result = conn.execute("SELECT date, daily_value, last_updated FROM precomputed_portfolio_values").fetchone()
+
+        # last_updated should be null if not provided
+        assert result[0] == '2024-01-01'
+        assert result[1] == 1000.0
+        assert result[2] is None
+
+        conn.close()
