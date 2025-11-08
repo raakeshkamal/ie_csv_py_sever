@@ -3,35 +3,47 @@
 A Python web server for uploading batches of trading statement CSV files (e.g., GIA and ISA accounts), merging them into a unified SQLite database with an added `Account_Type` column and `Ticker` enrichment. The upload endpoint handles merging and saving to DB, while a separate endpoint computes and returns data for interactive graphs: a histogram of monthly net contributions (buys positive, sells negative) and a line graph of actual portfolio value over time (including asset price changes via historical prices from yfinance). Each new upload overwrites the previous merged data to keep only the latest batch. Graphs are embedded directly in the page after upload and chart generation (no download needed). Tickers are extracted in the background using Yahoo Finance API searches.
 
 ## Features
-- Web interface for batch file uploads using FastAPI and HTMX.
-- Automatic parsing and merging using Pandas (skips header rows, cleans data like dates and currencies).
-- Stores merged data in SQLite database (`db/merged_trading.db`), overwriting on new uploads.
-- Background extraction of stock/ETF tickers for each unique security using Yahoo Finance API (prefers LSE tickers).
-- Separate endpoints: `/upload/` for data processing, `/portfolio-values/` for computing monthly net and daily actual portfolio values using yfinance historical prices.
-- Actual portfolio value calculation: Simulates daily holdings from trades (buys increase shares, sells decrease), fetches historical closing prices, computes sum(holdings * prices) for each day, with caching in DB for performance.
-- Generates and embeds Plotly graphs: monthly net contributions histogram and cumulative portfolio value line graph (combines GIA/ISA data).
-- Uses UV for dependency management, Jinja2 for templating, and Plotly for interactive visualizations.
+- Web interface for batch file uploads using FastAPI and HTMX
+- Automatic parsing and merging of trading statement CSVs using Pandas
+- CSV preprocessing: skips title rows, cleans currency formatting (£ and commas), parses dates, and standardizes columns
+- Stores merged data in a SQLite database (`db/merged_trading.db`) that overwrites on each new upload
+- Ticker extraction using Yahoo Finance search API with ISIN lookup (preferring LSE/.L tickers when available)
+- Multi-currency price conversion with FX rate handling (GBp, USD, EUR) to ensure consistent GBP valuations
+- Caching system for historical prices and FX rates to optimize performance and reduce API calls
+- Parallel processing of ticker lookups and price fetching for improved performance
+- Separate endpoints: `/upload/` for data processing and storage, `/portfolio-values/` for portfolio calculations
+- Actual portfolio value calculation that:
+  - Simulates daily holdings from trades (buys increase shares, sells decrease)
+  - Forward-fills holdings for non-trade days
+  - Fetches historical closing prices from yfinance for all tickers
+  - Converts all prices to GBP using appropriate currency conversions
+  - Caches prices in database to avoid refetching
+- Generates interactive Plotly charts: monthly net contributions (histogram) and portfolio value over time (line graph)
+- Uses UV for dependency management, Jinja2 for templating, and Plotly for visualizations
 
 ## Project Structure
 ```
 .
-├── .gitignore              # Git ignore rules
-├── pyproject.toml          # Dependencies managed by UV
-├── uv.lock                 # UV lockfile (auto-generated)
-├── README.md               # This file
-├── .vscode/                # VSCode settings
-│   └── settings.json
+├── .gitignore                     # Git ignore rules (excludes venv, __pycache__, *.db, trading_statements/)
+├── pyproject.toml                 # Dependencies managed by UV
+├── uv.lock                        # UV lockfile (auto-generated)
+├── README.md                      # This file
+├── .vscode/
+│   └── settings.json             # VSCode settings with Ruff linting/formatting
 ├── src/
-│   ├── __init__.py         # Package init (empty)
-│   ├── main.py             # FastAPI application with upload endpoint and background tasks
-│   ├── merge_csv.py        # CSV parsing and merging logic
-│   ├── extract_tickers.py  # Standalone script for ticker extraction (also called in background)
-│   ├── test_merge.py       # Test script for merging sample CSVs
+│   ├── __init__.py               # Package init
+│   ├── main.py                   # FastAPI application with upload and portfolio-value endpoints
+│   ├── merge_csv.py              # CSV parsing and merging logic
+│   ├── tests/                    # Test utilities and standalone scripts
+│   │   ├── extract_tickers.py    # Standalone ticker extraction script for existing DB
+│   │   ├── test_merge.py         # Test script for merging sample CSVs
+│   │   ├── get_historical_data.py # Utility to fetch historical yfinance data
+│   │   └── test_price_factors.py # Price comparison and factor detection tool
 │   └── templates/
-│       └── upload.html     # Upload form with HTMX and Plotly integration
-├── db/                     # Database directory (auto-created)
-│   └── merged_trading.db   # SQLite database (generated after upload)
-└── trading_statements/     # Sample CSV files (not committed, add your own)
+│       └── upload.html           # Upload form with HTMX and Plotly integration
+├── db/                           # Database directory (auto-created on first run)
+│   └── merged_trading.db         # SQLite database with trades and prices tables
+└── trading_statements/           # Sample CSV files (not committed, add your own)
     ├── GIA_Trading_statement_*.csv
     └── ISA_Trading_statement_*.csv
 ```
@@ -80,41 +92,133 @@ uv run python src/extract_tickers.py
 ```
 
 ## CSV Format Assumptions
-- Row 1: Title (ignored).
-- Row 2: Headers (Security / ISIN, Transaction Type, Quantity, Share Price, Total Trade Value, Trade Date/Time, Settlement Date, Broker).
-- Data rows: Transactions with £ in currency fields (automatically cleaned to floats).
-- Dates in format `dd/mm/yy` or `dd/mm/yy HH:MM:SS`.
-- Account type extracted from filename prefix (e.g., 'GIA_' → 'GIA'; fallback to search in name).
-- Security / ISIN format: e.g., "Vanguard FTSE Developed World UCITS ETF / ISIN GB00B3XXRP09" (regex extracts name and ISIN for ticker lookup).
+- Row 1: Title (ignored)
+- Row 2: Headers with these expected columns:
+  - `Security / ISIN`
+  - `Transaction Type`
+  - `Quantity`
+  - `Share Price`
+  - `Total Trade Value`
+  - `Trade Date/Time`
+  - `Settlement Date`
+  - `Broker`
+- Data rows: Transaction records
+- Currency formatting: Fields with '£' symbols and commas are automatically cleaned to float values
+- Date formats: `dd/mm/yy HH:MM:SS` (preferred) or `dd/mm/yy` (fallback)
+- Account type detection: Extracted from filename (e.g., 'GIA_' → 'GIA', 'ISA_' → 'ISA') with fallback text search
+- Security / ISIN format example: `"Vanguard FTSE Developed World UCITS ETF / ISIN GB00B3XXRP09"` (regex parses name and ISIN for ticker lookup)
 
 ## Graphs Explanation
-- **Monthly Net Contributions Histogram**: Bars show net cash flow per month (positive for buys/investments, negative for sells/withdrawals). Combines GIA and ISA.
-- **Actual Portfolio Value Line Graph**: Daily portfolio value over time, simulating holdings from trades and multiplying by historical closing prices from yfinance (includes asset price changes, dividends not included). Aggregates across accounts; invalid tickers skipped (value 0).
-- Charts are interactive (zoom, hover) via Plotly and rendered client-side from server-computed data.
+- **Monthly Net Contributions Histogram**: Bars show net cash flow per month (positive for buys/investments, negative for sells/withdrawals). Combines GIA and ISA data for a holistic view of contributions/distributions.
+- **Actual Portfolio Value Line Graph**: Daily portfolio value over time based on simulated holdings from trades multiplied by historical closing prices from yfinance. The calculation:
+  - Simulates holdings cumulatively (buys increase shares, sells decrease them)
+  - Forward-fills holdings for non-trade days
+  - Fetches and converts all historical prices to GBP using proper currency conversions
+  - Applies FX rates for non-GBP securities (historic rates cached to avoid refetching)
+  - Calculates daily value as Σ(holdings × price) across all tickers
+  - Aggregates across all account types; invalid tickers contribute 0 value
+- Charts are interactive (zoom, hover) via Plotly and rendered client-side from server-computed data
 
 ## Ticker Extraction
-- For each unique "Security / ISIN", searches Yahoo Finance API by security name (prefers LSE/.L tickers, ETF/Equity types).
-- Historical prices fetched via yfinance for valid tickers over the trade date range, cached in `prices` table in DB to avoid refetching.
-- Fallback to ISIN search if name search fails.
-- Results stored in `Ticker` column (e.g., "VUSA.L" or "Not found").
-- Rate-limited by Yahoo; for many securities, it may take time (background task handles it post-upload).
+- **Extraction Process**: For each unique "Security / ISIN", the system:
+  - Parses security name and ISIN using regex
+  - Searches Yahoo Finance API by security name (primary method)
+  - Prefers LSE exchange or .L suffix tickers, with ETF/Equity quote types
+  - Falls back to ISIN-based search if name search yields no results
+  - Stores results in database `Ticker` column (e.g., "VUSA.L" or "Not found")
+- **Price Caching**: The system maintains two tables in SQLite:
+  - `trades`: Merged transaction data with ticker mappings
+  - `prices`: Historical prices and FX rates indexed by ticker and date to avoid refetching
+- **Multi-Currency Handling**:
+  - Detects currency for each ticker (GBP, GBp, USD, EUR, etc.)
+  - Converts GBp prices (pence) to GBP by dividing by 100
+  - Fetches appropriate FX rates for non-GBP securities (GBPUSD=X, EURGBP=X)
+  - Caches FX rates to optimize performance
+- Note: Yahoo Finance API may rate-limit requests; extraction happens synchronously during upload to ensure tickers are available for charts
 
 ## Development Notes
-- Edit code in `src/` and restart/reload as needed (use `--reload` flag).
-- yfinance usage: Fetches historical 'Close' prices; handles missing data with forward-fill; errors logged but computation continues with 0 for failed tickers.
-- Portfolio computation: Holdings simulated by cumulative quantity adjustments on trade dates, forward-filled for non-trade days; value = sum(holdings_per_ticker * price_per_ticker) per day.
-- Ruff is configured for linting/formatting in `.vscode/settings.json`.
-- Database is overwritten on each upload; no versioning.
-- For production: Remove `--reload`, use Gunicorn/HTTPS, and consider caching ticker lookups.
-- Error handling: Invalid CSVs or API errors return JSON error messages displayed on the page.
-- Debug prints in console for merging, computations, and ticker searches.
+- **Live Reload**: Edit code in `src/` and restart/reload as needed (FastAPI's `--reload` flag recommended for development)
+- **Linting/Formatting**: Ruff is configured for linting/formatting in `.vscode/settings.json` (runs on save)
+- **Database**: SQLite database is overwritten on each upload (no versioning)
+- **Price Fetching**: yfinance fetches historical 'Close' prices; handles missing data with forward-fill
+- **Error Handling**: Invalid CSVs or API errors return JSON error messages displayed in the browser
+- **Logging**: Comprehensive logging to console for merging, computations, ticker searches, and price conversions
+- **Test Scripts**: Several utility scripts in `src/tests/` for debugging and development:
+  - `test_merge.py`: Test merging without the web interface
+  - `extract_tickers.py`: Run ticker extraction standalone on existing DB
+  - `get_historical_data.py`: Fetch and inspect historical yfinance data
+  - `test_price_factors.py`: Analyze price ratios between CSV and yfinance data
+- **Performance Optimizations**:
+  - Parallel processing of ticker lookups and price fetching
+  - Price and FX caching to avoid redundant API calls
+  - Efficient DataFrame operations using vectorized pandas methods
+- **Production Considerations**:
+  - Remove `--reload` flag
+  - Use Gunicorn or similar production server
+  - Implement HTTPS
+  - Consider additional caching strategies
+  - Monitor API rate limits
+
+## Test Utilities (src/tests/)
+The project includes several test scripts in the `src/tests/` directory:
+
+- **extract_tickers.py**: Standalone script to run ticker extraction on an existing database. Useful for reprocessing tickers without re-uploading CSV files.
+  ```bash
+  uv run python src/tests/extract_tickers.py
+  ```
+
+- **test_merge.py**: Test merging sample CSV files without the web interface. Automatically reads sample GIA and ISA files from `trading_statements/`, merges them, saves to DB, extracts tickers, and tests the portfolio values endpoint.
+  ```bash
+  uv run python src/test_merge.py  # From project root
+  ```
+
+- **get_historical_data.py**: Utility for fetching and displaying historical price data for a specific ticker. Helpful for debugging price issues or checking data availability.
+  ```bash
+  uv run python src/tests/get_historical_data.py  # Default ticker: CSH2.L
+  ```
+
+- **test_price_factors.py**: Advanced analysis tool that compares CSV prices to yfinance prices for the same dates to detect constant multiplication factors (useful for identifying unit discrepancies like pence vs pounds). Also tests FX conversion logic.
+  ```bash
+  uv run python src/tests/test_price_factors.py
+  ```
 
 ## Troubleshooting
-- If dependencies fail: Run `uv sync --dev` or check `pyproject.toml` for versions.
-- Server not starting: Ensure Python 3.8+ and UV installed. Check for port 8000 conflicts.
-- CSV issues: Ensure files match the expected format (see sample in `trading_statements/`). Invalid columns or dates will raise errors.
-- Ticker extraction fails: Check internet connection; Yahoo API may rate-limit. Run `src/extract_tickers.py` manually for debugging.
-- No graphs: Ensure Plotly CDN loads; check browser console for JS errors.
-- Database not created: Upload files first; `db/` directory auto-creates.
-- Charts not generating: Ensure ticker extraction completed (wait a few seconds); check browser console for JS errors; verify yfinance fetches succeed (no internet issues).
-- Linter errors in VSCode: Ruff/Basedpyright may flag type issues in dynamic code; functionality is unaffected.
+
+**Dependency Issues**
+- If dependencies fail to install: Run `uv sync --dev` or check `pyproject.toml` for version conflicts
+- Ensure Python 3.8+ is installed and UV is available in PATH
+
+**Server Problems**
+- Server not starting: Check for port 8000 conflicts, verify UV installation
+- Use `uv run uvicorn src.main:app --reload --host 0.0.0.0 --port 8000` for detailed error output
+
+**CSV Upload Issues**
+- CSV issues: Ensure files match expected format (see CSV Format Assumptions)
+- Invalid columns or malformed dates will raise errors displayed in the browser
+- Check browser console for JavaScript errors related to file handling
+
+**Ticker & Price Issues**
+- Ticker extraction fails: Check internet connection; Yahoo Finance API may rate-limit
+- Run `uv run python src/tests/extract_tickers.py` manually to debug ticker extraction
+- No graphs appearing: Ensure ticker extraction completed (happens synchronously during upload)
+- Verify yfinance can fetch data (check internet connectivity, ticker symbols are valid)
+
+**Database & Caching**
+- Database not created: Upload files first; `db/` directory auto-creates
+- Old data persisting: Remember database overwrites on each upload (this is by design)
+- Price caching: Check `prices` table in SQLite DB to verify caching is working
+
+**Chart Generation**
+- Charts not displaying: Check browser console for JavaScript errors; verify Plotly CDN loaded
+- Empty chart data: Verify ticker extraction found valid tickers; check console logs for errors
+- Mismatched data lengths: Check server logs; may indicate data validation issues
+
+**Visual Studio Code**
+- Linter errors: Ruff/Basedpyright may flag type issues in dynamic code; these don't affect runtime
+- Ensure Ruff extension is installed and enabled
+- Format on save is configured in `.vscode/settings.json`
+
+**Performance**
+- Slow ticker extraction: Normal for many securities due to Yahoo Finance API rate limiting
+- Slow chart generation: First run fetches all historical data; subsequent runs use cache
+- Consider running ticker extraction during off-hours for large portfolios
