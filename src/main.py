@@ -42,20 +42,11 @@ def search_ticker_for_isin(security_name: str, isin: str) -> Optional[str]:
             if lse_candidates:
                 # Sort by relevance (e.g., name similarity), take first
                 quote = lse_candidates[0]
-            else:
-                # Fallback to first valid ETF/Equity
-                valid_quotes = [
-                    q for q in data["quotes"] if q.get("quoteType") in ["ETF", "EQUITY"]
-                ]
-                if valid_quotes:
-                    quote = valid_quotes[0]
-                else:
-                    quote = data["quotes"][0]
-
-            symbol = quote.get("symbol")
-            if symbol and symbol != isin:
-                # Optional: Verify if possible (yfinance doesn't easily provide ISIN, so assume match)
-                return symbol
+                symbol = quote.get("symbol")
+                if symbol and symbol != isin:
+                    # Optional: Verify if possible (yfinance doesn't easily provide ISIN, so assume match)
+                    return symbol
+            # If no LSE candidates, continue to ISIN search fallback
 
         # Fallback: Search with ISIN
         url = f"https://query1.finance.yahoo.com/v1/finance/search?q={isin}"
