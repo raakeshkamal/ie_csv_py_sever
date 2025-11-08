@@ -44,15 +44,18 @@ def parse_date(date_str: str) -> datetime:
     """
     if pd.isna(date_str):
         return pd.NaT
-    try:
-        # Try full datetime format first
-        return pd.to_datetime(date_str, format="%d/%m/%y %H:%M:%S", errors="coerce")
-    except:
-        try:
-            # Try date only
-            return pd.to_datetime(date_str, format="%d/%m/%y", errors="coerce")
-        except:
-            return pd.NaT
+
+    # Try full datetime format first
+    result = pd.to_datetime(date_str, format="%d/%m/%y %H:%M:%S", errors="coerce")
+    if not pd.isna(result):
+        return result
+
+    # Try date only format
+    result = pd.to_datetime(date_str, format="%d/%m/%y", errors="coerce")
+    if not pd.isna(result):
+        return result
+
+    return pd.NaT
 
 
 def merge_csv_files(file_data: List[Tuple[str, str]]) -> pd.DataFrame:
