@@ -15,8 +15,44 @@ from pathlib import Path
 src_path = str(Path(__file__).parent.parent / "src")
 sys.path.insert(0, src_path)
 
-from main import app
-from merge_csv import merge_csv_files
+# Import using package-qualified imports to support relative imports
+from src.main import app
+from src.merge_csv import merge_csv_files
+from src.database import (
+    get_connection,
+    reset_database,
+    has_trades_data,
+    create_prices_table,
+    save_trades,
+    load_trades,
+    export_trades_as_list,
+    cache_price,
+    get_cached_prices
+)
+from src.tickers import (
+    extract_security_and_isin,
+    search_ticker_for_isin,
+    extract_tickers_for_df,
+    add_tickers_to_df
+)
+from src.prices import (
+    get_currency,
+    get_currencies_parallel,
+    get_min_hist_date,
+    get_common_start_date,
+    fetch_and_convert_history,
+    convert_currency,
+    get_fx_rates,
+    fetch_prices_parallel,
+    get_needed_currencies
+)
+from src.portfolio import (
+    compute_monthly_net_contributions,
+    simulate_holdings,
+    compute_daily_portfolio_values,
+    get_valid_unique_tickers,
+    calculate_portfolio_values
+)
 
 
 @pytest.fixture

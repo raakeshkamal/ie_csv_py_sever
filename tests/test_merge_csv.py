@@ -4,7 +4,7 @@ Unit tests for CSV merging functionality.
 
 import pandas as pd
 import pytest
-from merge_csv import (
+from src.merge_csv import (
     merge_csv_files,
     extract_account_type,
     clean_currency,

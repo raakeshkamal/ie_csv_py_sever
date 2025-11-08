@@ -64,12 +64,13 @@ async def export_trades():
     """
     try:
         if not has_trades_data():
-            raise HTTPException(status_code=404, detail="No trades data in database")
+            return JSONResponse(
+                content={"success": False, "error": "No trades data in database"},
+                status_code=404
+            )
 
         trades = export_trades_as_list()
         return JSONResponse(content={"success": True, "trades": trades})
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error exporting trades: {e}")
         return JSONResponse(

@@ -198,30 +198,52 @@ def convert_currency(
     return converted_prices
 
 
-def get_fx_rates(fx_ticker: str, dates: pd.DatetimeIndex, currency: str) -> Optional[pd.Series]:
+def get_fx_rates(currency_or_fx_ticker: str, dates: pd.DatetimeIndex, currency: Optional[str] = None, db_path: Optional[str] = None) -> Optional[pd.Series]:
     """
     Get FX rates for a currency, using cache or fetching from yfinance.
+
+    Can be called in two ways:
+    1. With FX ticker: get_fx_rates(fx_ticker, dates, currency, db_path)
+    2. With currency code: get_fx_rates(currency_code, dates, db_path=db_path)
+
     Returns pandas Series of rates indexed by dates.
     """
     try:
+        # Handle flexible calling patterns
+        if currency is None:
+            # Called with (currency, dates) - need to look up FX ticker
+            currency_param = currency_or_fx_ticker
+            if currency_param in FX_CONFIG:
+                fx_ticker_str, _ = FX_CONFIG[currency_param]
+            elif currency_param in ["GBP", "GBp"]:
+                # No FX conversion needed
+                return pd.Series(np.ones(len(dates)), index=dates)
+            else:
+                logger.warning(f"Unknown currency {currency_param}, assuming 1:1")
+                return pd.Series(np.ones(len(dates)), index=dates)
+        else:
+            # Called with (fx_ticker, dates, currency)
+            fx_ticker_str = currency_or_fx_ticker
+            currency_param = currency
+
         # Check cache first
         start_date = dates.min().date()
         end_date = dates.max().date()
-        cached = get_cached_fx_rates(fx_ticker, str(start_date), str(end_date))
+        cached = get_cached_fx_rates(fx_ticker_str, str(start_date), str(end_date), db_path)
 
         if cached is not None:
             date_list = [d.date() for d in dates]
             cached_rates = cached.reindex(date_list).ffill()["close"].fillna(1.0).values
-            logger.info(f"Cached FX rates for {fx_ticker}")
+            logger.info(f"Cached FX rates for {fx_ticker_str}")
             return pd.Series(cached_rates, index=dates)
 
         # Fetch from yfinance
-        logger.info(f"Fetching FX rates for {currency}: {fx_ticker}")
-        fx_ticker_obj = yf.Ticker(fx_ticker)
+        logger.info(f"Fetching FX rates for {currency_param}: {fx_ticker_str}")
+        fx_ticker_obj = yf.Ticker(fx_ticker_str)
         fx_hist = fx_ticker_obj.history(start=start_date, end=end_date + pd.Timedelta(days=1))
 
         if fx_hist.empty:
-            logger.warning(f"No FX data for {currency}, assuming 1:1")
+            logger.warning(f"No FX data for {currency_param}, assuming 1:1")
             return pd.Series(np.ones(len(dates)), index=dates)
 
         # Handle timezone
@@ -235,7 +257,7 @@ def get_fx_rates(fx_ticker: str, dates: pd.DatetimeIndex, currency: str) -> Opti
         fx_rates = fx_hist["Close"].reindex(dates).ffill().fillna(1.0)
 
         # Cache the fetched rates
-        conn = get_connection()
+        conn = get_connection(db_path)
         try:
             for i in range(len(fx_rates)):
                 fx_val = fx_rates.iloc[i]
@@ -243,17 +265,17 @@ def get_fx_rates(fx_ticker: str, dates: pd.DatetimeIndex, currency: str) -> Opti
                     date_str = dates[i].strftime("%Y-%m-%d")
                     conn.execute(
                         "INSERT OR REPLACE INTO prices (ticker, date, close) VALUES (?, ?, ?)",
-                        (fx_ticker, date_str, float(fx_val))
+                        (fx_ticker_str, date_str, float(fx_val))
                     )
             conn.commit()
-            logger.info(f"FX rates for {currency} fetched and cached: {len(fx_rates)} days")
+            logger.info(f"FX rates for {currency_param} fetched and cached: {len(fx_rates)} days")
         finally:
             conn.close()
 
         return fx_rates
 
     except Exception as e:
-        logger.error(f"Error fetching FX for {currency}: {e}, assuming 1:1")
+        logger.error(f"Error fetching FX for {currency_param}: {e}, assuming 1:1")
         return pd.Series(np.ones(len(dates)), index=dates)
 
 
