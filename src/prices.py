@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # FX rate configuration: (ticker, multiply_flag)
 # multiply_flag True means multiply by rate, False means divide
 FX_CONFIG = {
-    "USD": ("GBPUSD=X", False),  # divide by rate (USD prices ÷ USDGBP = GBP)
+    "USD": ("GBPUSD=X", False),  # divide by rate (USD prices ÷ GBPUSD = GBP)
     "EUR": ("EURGBP=X", True),   # multiply by rate (EUR prices × EURGBP = GBP)
 }
 
@@ -142,15 +142,15 @@ def fetch_and_convert_history(
             logger.warning(f"No historical data for {ticker}")
             return ticker, cached_prices
 
-        # Handle timezone
-        try:
-            if hist.index.tz is not None:
-                hist.index = hist.index.tz_localize(None)
-        except (AttributeError, TypeError):
-            pass
+        # Handle timezone - make index naive and date-only
+        if hist.index.tz is not None:
+            hist.index = hist.index.tz_convert('UTC').tz_localize(None)
+        # Normalize to date-only (remove time component)
+        hist.index = pd.DatetimeIndex([idx.date() for idx in hist.index])
 
         # Get prices and forward-fill missing days
-        prices = hist["Close"].reindex(dates).ffill().fillna(0.0)
+        prices = hist["Close"].reindex([d.date() for d in dates]).ffill().fillna(0.0)
+        prices.index = dates  # Restore original dates index
 
         # Convert currency if needed
         converted_prices = convert_currency(prices, reported_currency, ticker, dates)
@@ -193,7 +193,7 @@ def convert_currency(
                 converted_prices = prices * rates.reindex(dates).ffill().fillna(1.0)
             else:
                 converted_prices = prices / rates.reindex(dates).ffill().fillna(1.0)
-            logger.info(f"Converted {ticker} ({reported_currency}) to GBP using FX rates")
+            logger.info(f"Converted {ticker} ({reported_currency}) to GBP using FX rates. Sample rates: {rates.head().tolist()[:3]}")
 
     return converted_prices
 
@@ -246,15 +246,15 @@ def get_fx_rates(currency_or_fx_ticker: str, dates: pd.DatetimeIndex, currency: 
             logger.warning(f"No FX data for {currency_param}, assuming 1:1")
             return pd.Series(np.ones(len(dates)), index=dates)
 
-        # Handle timezone
-        try:
-            if fx_hist.index.tz is not None:
-                fx_hist.index = fx_hist.index.tz_localize(None)
-        except Exception:
-            pass
+        # Handle timezone - make index naive and date-only
+        if fx_hist.index.tz is not None:
+            fx_hist.index = fx_hist.index.tz_convert('UTC').tz_localize(None)
+        # Normalize to date-only (remove time component)
+        fx_hist.index = pd.DatetimeIndex([idx.date() for idx in fx_hist.index])
 
         # Forward-fill and return
-        fx_rates = fx_hist["Close"].reindex(dates).ffill().fillna(1.0)
+        fx_rates = fx_hist["Close"].reindex([d.date() for d in dates]).ffill().fillna(1.0)
+        fx_rates.index = dates  # Restore original dates index
 
         # Cache the fetched rates
         conn = get_connection(db_path)

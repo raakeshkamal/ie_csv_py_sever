@@ -199,6 +199,6 @@ def get_cached_prices(ticker: str, start_date: str, end_date: str, db_path: Opti
         conn.close()
 
 
-def get_cached_fx_rates(fx_ticker: str, start_date: str, end_date: str) -> Optional[dict]:
+def get_cached_fx_rates(fx_ticker: str, start_date: str, end_date: str, db_path: Optional[str] = None) -> Optional[dict]:
     """Get cached FX rates."""
-    return get_cached_prices(fx_ticker, start_date, end_date)
+    return get_cached_prices(fx_ticker, start_date, end_date, db_path)
