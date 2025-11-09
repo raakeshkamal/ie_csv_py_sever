@@ -21,6 +21,18 @@ import src.database
 from src.main import app
 
 
+def setup_isin_mapping(client, isin, ticker):
+    """Helper function to set up ISIN to ticker mapping."""
+    response = client.post(
+        "/mapping/",
+        json=[{
+            "isin": isin,
+            "ticker": ticker
+        }]
+    )
+    return response
+
+
 @pytest.mark.integration
 class TestRootEndpoint:
     def test_root_endpoint_renders_upload_page(self):
@@ -43,7 +55,11 @@ class TestResetEndpoint:
         with patch.object(src.database, 'DB_PATH', tmp_db_path):
             client = TestClient(app)
 
-            # First upload some data
+            # Reset first to create tables
+            client.post("/reset/")
+            # First upload some data (need to setup ISIN→ticker mapping first)
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
+
             csv_content = """Trading Statement,
 Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
 Vanguard FTSE 250 / ISIN IE00BYYHSQ67,Buy,5,£30.41,£152.05,01/11/24 12:45:32,05/11/24,InvestEngine
@@ -118,6 +134,12 @@ class TestExportTradesEndpoint:
         with patch.object(src.database, 'DB_PATH', tmp_db_path):
             client = TestClient(app)
 
+            # Reset first to create tables
+            client.post("/reset/")
+            # Setup ISIN→ticker mappings
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
+            setup_isin_mapping(client, "IE00B4L5Y983", "VMID.L")
+
             # Upload some data first
             csv_content = """Trading Statement,
 Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
@@ -155,7 +177,7 @@ iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,
             # Verify trade structure
             trade = data["trades"][0]
             assert "Security / ISIN" in trade
-            assert "Ticker" in trade
+            assert "ticker" in trade
             assert "Quantity" in trade
             assert isinstance(trade["Trade Date/Time"], str)
 
@@ -166,6 +188,11 @@ iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,
 
         with patch.object(src.database, 'DB_PATH', tmp_db_path):
             client = TestClient(app)
+
+            # Reset first to create tables
+            client.post("/reset/")
+            # Setup ISIN→ticker mapping
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
 
             # Upload one trade
             csv_content = """Trading Statement,
@@ -203,7 +230,7 @@ Vanguard FTSE 250 / ISIN IE00BYYHSQ67,Buy,5,£30.41,£152.05,01/11/24 12:45:32,0
 
             # Check string values
             assert "IE00BYYHSQ67" in trade["Security / ISIN"]
-            assert trade["Ticker"] == "VUSA.L"
+            assert trade["ticker"] == "VUSA.L"
             assert trade["Transaction Type"] == "Buy"
 
 
@@ -228,6 +255,10 @@ class TestUploadEndpoint:
 
         with patch.object(src.database, 'DB_PATH', tmp_db_path):
             client = TestClient(app)
+            # Reset first to create tables
+            client.post("/reset/")
+            # Setup ISIN→ticker mapping
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
             file_content = BytesIO(sample_gia_csv.encode('utf-8'))
 
             with patch('requests.get') as mock_requests:
@@ -255,6 +286,11 @@ class TestUploadEndpoint:
 
         with patch.object(src.database, 'DB_PATH', tmp_db_path):
             client = TestClient(app)
+            # Reset first to create tables
+            client.post("/reset/")
+            # Setup ISIN→ticker mappings for both files
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
+            setup_isin_mapping(client, "IE00BK5BQT80", "VWRL.L")
             gia_file = BytesIO(sample_gia_csv.encode('utf-8'))
             isa_file = BytesIO(sample_isa_csv.encode('utf-8'))
 
@@ -285,6 +321,12 @@ class TestUploadEndpoint:
         with patch.object(src.database, 'DB_PATH', tmp_db_path):
             client = TestClient(app)
 
+            # Reset first to create tables
+            client.post("/reset/")
+
+            # Setup ISIN→ticker mapping for first upload
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
+
             # Upload first file
             csv_content_first = """Trading Statement,
 Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
@@ -306,7 +348,7 @@ Vanguard FTSE 250 / ISIN IE00BYYHSQ67,Buy,5,£30.41,£152.05,01/11/24 12:45:32,0
 
                 assert response1.status_code == 200
 
-            # Try to upload second file without resetting
+            # Try to upload second file without resetting (no mapping needed as it will fail before validation)
             csv_content_second = """Trading Statement,
 Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
 iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,06/11/24,InvestEngine
@@ -332,6 +374,11 @@ iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,
         with patch.object(src.database, 'DB_PATH', tmp_db_path):
             client = TestClient(app)
 
+            # Reset first to create tables
+            client.post("/reset/")
+            # Setup ISIN→ticker mapping
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
+
             # Upload first file
             csv_content_first = """Trading Statement,
 Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
@@ -356,6 +403,9 @@ Vanguard FTSE 250 / ISIN IE00BYYHSQ67,Buy,5,£30.41,£152.05,01/11/24 12:45:32,0
             # Reset
             reset_response = client.post("/reset/")
             assert reset_response.status_code == 200
+
+            # Setup ISIN→ticker mapping for second security
+            setup_isin_mapping(client, "IE00B4L5Y983", "ISF.L")
 
             # Upload different file after reset
             csv_content_second = """Trading Statement,
@@ -442,6 +492,11 @@ class TestPortfolioValuesEndpoint:
         with patch.object(src.database, 'DB_PATH', tmp_db_path):
             client = TestClient(app)
 
+            # Reset and setup ISIN mappings
+            client.post("/reset/")
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
+            setup_isin_mapping(client, "IE00B4L5Y983", "ISF.L")
+
             # Upload data first
             csv_content_trades = """Trading Statement,
 Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
@@ -517,6 +572,10 @@ class TestFullIntegrationFlow:
             reset_response = client.post("/reset/")
             assert reset_response.status_code == 200
             assert reset_response.json()["success"] is True
+
+            # Setup ISIN mappings
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
+            setup_isin_mapping(client, "IE00B4L5Y983", "ISF.L")
 
             # Step 2: Upload trades
             csv_content_trades = """Trading Statement,
@@ -700,6 +759,11 @@ class TestExportPricesEndpoint:
         with patch.object(src.database, 'DB_PATH', tmp_db_path):
             client = TestClient(app)
 
+            # Reset database and set up ISIN mappings
+            client.post("/reset/")
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
+            setup_isin_mapping(client, "IE00B4L5Y983", "ISF.L")
+
             # Upload trades first
             csv_content = """Trading Statement,
 Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
@@ -854,6 +918,10 @@ class TestBackgroundProcessingWorkflow:
 
             # Reset first
             client.post("/reset/")
+
+            # Set up ISIN mappings
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
+            setup_isin_mapping(client, "IE00B4L5Y983", "ISF.L")
 
             # Upload trades
             csv_content = """Trading Statement,
@@ -1010,6 +1078,10 @@ iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,
             reset_response = client.post("/reset/")
             assert reset_response.status_code == 200
 
+            # Set up ISIN mappings
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
+            setup_isin_mapping(client, "IE00B4L5Y983", "ISF.L")
+
             # Upload trades
             csv_content = """Trading Statement,
 Security / ISIN,Transaction Type,Quantity,Share Price,Total Trade Value,Trade Date/Time,Settlement Date,Broker
@@ -1091,6 +1163,9 @@ iShares Core MSCI / ISIN IE00B4L5Y983,Buy,10,£50.00,£500.00,02/11/24 10:30:00,
 
             # Reset (creates tables but they're empty)
             client.post("/reset/")
+
+            # Set up ISIN mapping
+            setup_isin_mapping(client, "IE00BYYHSQ67", "VUSA.L")
 
             # Upload trades
             csv_content = """Trading Statement,

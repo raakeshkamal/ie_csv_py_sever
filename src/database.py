@@ -137,7 +137,7 @@ def load_trades(conn: Optional[sqlite3.Connection] = None, db_path: Optional[str
 
 def export_trades_as_list(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """Export trades table as a list of dictionaries."""
-    df = load_trades(db_path=db_path)
+    df = load_trades_with_tickers(db_path=db_path)
     # Convert datetime columns to strings for JSON serialization
     for col in df.columns:
         if df[col].dtype.kind == 'M':  # datetime
@@ -202,3 +202,173 @@ def get_cached_prices(ticker: str, start_date: str, end_date: str, db_path: Opti
 def get_cached_fx_rates(fx_ticker: str, start_date: str, end_date: str, db_path: Optional[str] = None) -> Optional[dict]:
     """Get cached FX rates."""
     return get_cached_prices(fx_ticker, start_date, end_date, db_path)
+
+
+def create_isin_ticker_mapping_table(db_path: Optional[str] = None):
+    """Create the ISIN to ticker mapping table."""
+    conn = get_connection(db_path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS isin_to_ticker (
+                isin TEXT PRIMARY KEY,
+                ticker TEXT NOT NULL,
+                security_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_isin_ticker_mapping(isin: str, ticker: str, security_name: Optional[str], db_path: Optional[str] = None):
+    """Save or update ISIN to ticker mapping."""
+    conn = get_connection(db_path)
+    try:
+        # Check if ISIN already exists
+        cursor = conn.execute("SELECT COUNT(*) FROM isin_to_ticker WHERE isin = ?", (isin,))
+        exists = cursor.fetchone()[0] > 0
+
+        if exists:
+            # Update existing
+            conn.execute("""
+                UPDATE isin_to_ticker
+                SET ticker = ?, security_name = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE isin = ?
+            """, (ticker, security_name, isin))
+        else:
+            # Insert new
+            conn.execute("""
+                INSERT INTO isin_to_ticker (isin, ticker, security_name)
+                VALUES (?, ?, ?)
+            """, (isin, ticker, security_name))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_isin_ticker_mapping(isin: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Get ticker mapping for a specific ISIN."""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute("""
+            SELECT isin, ticker, security_name, created_at, updated_at
+            FROM isin_to_ticker
+            WHERE isin = ?
+        """, (isin,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                "isin": row[0],
+                "ticker": row[1],
+                "security_name": row[2],
+                "created_at": row[3],
+                "updated_at": row[4]
+            }
+        return None
+    finally:
+        conn.close()
+
+
+def get_all_isin_ticker_mappings(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get all ISIN to ticker mappings."""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute("""
+            SELECT isin, ticker, security_name, created_at, updated_at
+            FROM isin_to_ticker
+            ORDER BY isin
+        """)
+        mappings = []
+        for row in cursor.fetchall():
+            mappings.append({
+                "isin": row[0],
+                "ticker": row[1],
+                "security_name": row[2],
+                "created_at": row[3],
+                "updated_at": row[4]
+            })
+        return mappings
+    finally:
+        conn.close()
+
+
+def isin_exists_in_mapping(isin: str, db_path: Optional[str] = None) -> bool:
+    """Check if an ISIN exists in the mapping table."""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute("SELECT COUNT(*) FROM isin_to_ticker WHERE isin = ?", (isin,))
+        return cursor.fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
+def get_all_isins_from_trades(db_path: Optional[str] = None) -> List[str]:
+    """Get all unique ISINs from the trades table."""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute("SELECT DISTINCT isin FROM trades WHERE isin IS NOT NULL")
+        isins = [row[0] for row in cursor.fetchall()]
+        return isins
+    finally:
+        conn.close()
+
+
+def get_isins_without_mappings(db_path: Optional[str] = None) -> List[str]:
+    """Get all ISINs from trades that don't have ticker mappings."""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute("""
+            SELECT DISTINCT t.isin
+            FROM trades t
+            LEFT JOIN isin_to_ticker m ON t.isin = m.isin
+            WHERE t.isin IS NOT NULL AND m.isin IS NULL
+        """)
+        isins = [row[0] for row in cursor.fetchall()]
+        return isins
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return []  # No trades table means no missing ISINs
+        raise
+    finally:
+        conn.close()
+
+
+def load_trades_with_tickers(conn: Optional[sqlite3.Connection] = None, db_path: Optional[str] = None) -> pd.DataFrame:
+    """Load trades with ticker information via JOIN with mapping table."""
+    import pandas as pd
+    import sqlite3
+
+    close_conn = False
+    if conn is None:
+        conn = get_connection(db_path)
+        close_conn = True
+    try:
+        # Load trades with ticker mappings joined
+        query = """
+            SELECT
+                t.*,
+                m.ticker
+            FROM trades t
+            LEFT JOIN isin_to_ticker m ON t.isin = m.isin
+        """
+        df = pd.read_sql_query(query, conn)
+        return df
+    except (sqlite3.OperationalError, pd.errors.DatabaseError) as e:
+        if "no such table" in str(e):
+            return pd.DataFrame()
+        raise
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def validate_all_isins_have_mappings(db_path: Optional[str] = None) -> tuple[bool, list[str]]:
+    """
+    Check if all ISINs in trades have ticker mappings.
+    Returns (is_valid, missing_isins)
+    """
+    missing = get_isins_without_mappings(db_path)
+    return len(missing) == 0, missing
+

@@ -35,7 +35,7 @@ def temp_db_path():
 
 @pytest.fixture
 def sample_trades_df():
-    """Create sample trades DataFrame."""
+    """Create sample trades DataFrame with ticker column (simulating post-JOIN)."""
     data = {
         'Security / ISIN': ['Vanguard FTSE 250 / ISIN IE00BYYHSQ67', 'Vanguard FTSE 250 / ISIN IE00BYYHSQ67'],
         'Transaction Type': ['Buy', 'Buy'],
@@ -43,9 +43,19 @@ def sample_trades_df():
         'Share Price': [30.41, 31.00],
         'Total Trade Value': [152.05, 310.00],
         'Trade Date/Time': pd.to_datetime(['2024-01-02', '2024-01-15']),
-        'Ticker': ['VUSA.L', 'VUSA.L']
+        'isin': ['IE00BYYHSQ67', 'IE00BYYHSQ67'],
+        'security_name': ['Vanguard FTSE 250'] * 2,
+        'ticker': ['IE00BYYHSQ67', 'IE00BYYHSQ67']  # Ticker column from mapping
     }
     return pd.DataFrame(data)
+
+
+@pytest.fixture
+def sample_isin_mappings():
+    """Sample ISIN to ticker mappings for testing."""
+    return [
+        ("IE00BYYHSQ67", "VUSA.L", "Vanguard FTSE 250"),
+    ]
 
 
 @pytest.fixture
@@ -88,6 +98,8 @@ class TestCreatePrecomputedTables:
             WHERE type='table' AND name IN (
                 'precomputed_portfolio_values',
                 'precomputed_monthly_contributions',
+                'precomputed_ticker_prices',
+                'precomputed_ticker_daily_values',
                 'precompute_status'
             )
         """)
@@ -95,6 +107,8 @@ class TestCreatePrecomputedTables:
 
         assert 'precomputed_portfolio_values' in tables
         assert 'precomputed_monthly_contributions' in tables
+        assert 'precomputed_ticker_prices' in tables
+        assert 'precomputed_ticker_daily_values' in tables
         assert 'precompute_status' in tables
         conn.close()
 
@@ -110,8 +124,14 @@ class TestCreatePrecomputedTables:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [row[0] for row in cursor.fetchall()]
 
-        # Should have exactly these 3 tables
-        expected = {'precomputed_portfolio_values', 'precomputed_monthly_contributions', 'precompute_status'}
+        # Should have exactly these tables
+        expected = {
+            'precomputed_portfolio_values',
+            'precomputed_monthly_contributions',
+            'precomputed_ticker_prices',
+            'precomputed_ticker_daily_values',
+            'precompute_status'
+        }
         actual = set(tables)
         assert expected.issubset(actual)
         conn.close()
@@ -141,7 +161,25 @@ class TestPrecomputePortfolioData:
         mc_count = cursor.fetchone()[0]
         assert mc_count > 0
 
-        # Check status table
+        # Check ticker prices table
+        cursor = conn.execute("SELECT COUNT(*) FROM precomputed_ticker_prices")
+        tp_count = cursor.fetchone()[0]
+        assert tp_count > 0
+
+        # Check ticker daily values table (NEW)
+        cursor = conn.execute("SELECT COUNT(*) FROM precomputed_ticker_daily_values")
+        tdv_count = cursor.fetchone()[0]
+        assert tdv_count > 0
+
+        # The count should equal portfolio_values_count * number_of_tickers
+        # Each date has a value for each ticker
+        cursor = conn.execute("""
+            SELECT COUNT(DISTINCT ticker) FROM precomputed_ticker_daily_values
+        """)
+        ticker_count = cursor.fetchone()[0]
+        assert ticker_count >= 1
+
+        # Status table
         cursor = conn.execute("SELECT status FROM precompute_status")
         status = cursor.fetchone()[0]
         assert status == "completed"
@@ -159,7 +197,7 @@ class TestPrecomputePortfolioData:
             'Share Price': [30.41],
             'Total Trade Value': [152.05],
             'Trade Date/Time': pd.to_datetime(['2024-01-01']),
-            'Ticker': [None]
+            'ticker': [None]
         }
         df = pd.DataFrame(data)
 
@@ -212,6 +250,10 @@ class TestGetPrecomputedPortfolioData:
             VALUES (?, ?, ?)
         """, ("2024-01-01", 1000.0, now))
         conn.execute("""
+            INSERT INTO precomputed_ticker_daily_values (date, ticker, daily_value, last_updated)
+            VALUES (?, ?, ?, ?)
+        """, ("2024-01-01", "VUSA.L", 500.0, now))
+        conn.execute("""
             INSERT INTO precomputed_monthly_contributions (month, net_value, last_updated)
             VALUES (?, ?, ?)
         """, ("2024-01", 1000.0, now))
@@ -224,9 +266,12 @@ class TestGetPrecomputedPortfolioData:
         assert "daily_dates" in result
         assert "daily_values" in result
         assert "monthly_net" in result
+        assert "daily_ticker_values" in result
         assert len(result["daily_dates"]) == 1
         assert len(result["daily_values"]) == 1
         assert result["daily_values"][0] == 1000.0
+        assert "VUSA.L" in result["daily_ticker_values"]
+        assert result["daily_ticker_values"]["VUSA.L"][0] == 500.0
 
     def test_get_data_empty(self, temp_db_path):
         """Test retrieving data when database is empty."""
@@ -253,6 +298,68 @@ class TestGetPrecomputedPortfolioData:
         result = get_precomputed_portfolio_data(db_path=temp_db_path)
 
         assert result is None
+
+    def test_get_data_with_multiple_tickers(self, temp_db_path):
+        """Test retrieving precomputed data with ticker values for multiple tickers."""
+        create_precomputed_tables(db_path=temp_db_path)
+        conn = get_connection(temp_db_path)
+
+        # Insert sample data
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Portfolio values
+        conn.execute("""INSERT INTO precomputed_portfolio_values (date, daily_value, last_updated)
+                       VALUES (?, ?, ?)""", ("2024-01-01", 1530.0, now))
+        conn.execute("""INSERT INTO precomputed_portfolio_values (date, daily_value, last_updated)
+                       VALUES (?, ?, ?)""", ("2024-01-02", 1575.0, now))
+
+        # Ticker daily values
+        conn.execute("""INSERT INTO precomputed_ticker_daily_values (date, ticker, daily_value, last_updated)
+                       VALUES (?, ?, ?, ?)""", ("2024-01-01", "VUSA.L", 505.0, now))
+        conn.execute("""INSERT INTO precomputed_ticker_daily_values (date, ticker, daily_value, last_updated)
+                       VALUES (?, ?, ?, ?)""", ("2024-01-01", "VWRL.L", 1025.0, now))
+        conn.execute("""INSERT INTO precomputed_ticker_daily_values (date, ticker, daily_value, last_updated)
+                       VALUES (?, ?, ?, ?)""", ("2024-01-02", "VUSA.L", 515.0, now))
+        conn.execute("""INSERT INTO precomputed_ticker_daily_values (date, ticker, daily_value, last_updated)
+                       VALUES (?, ?, ?, ?)""", ("2024-01-02", "VWRL.L", 1060.0, now))
+
+        # Monthly contributions
+        conn.execute("""INSERT INTO precomputed_monthly_contributions (month, net_value, last_updated)
+                       VALUES (?, ?, ?)""", ("2024-01", 1500.0, now))
+        conn.commit()
+        conn.close()
+
+        result = get_precomputed_portfolio_data(db_path=temp_db_path)
+
+        assert result is not None
+        assert "daily_dates" in result
+        assert "daily_values" in result
+        assert "monthly_net" in result
+        assert "daily_ticker_values" in result
+
+        # Check dates
+        assert len(result["daily_dates"]) == 2
+        assert result["daily_dates"][0] == "2024-01-01"
+        assert result["daily_dates"][1] == "2024-01-02"
+
+        # Check total values
+        assert len(result["daily_values"]) == 2
+        assert result["daily_values"][0] == 1530.0
+        assert result["daily_values"][1] == 1575.0
+
+        # Check ticker breakdown
+        assert "VUSA.L" in result["daily_ticker_values"]
+        assert "VWRL.L" in result["daily_ticker_values"]
+        assert len(result["daily_ticker_values"]["VUSA.L"]) == 2
+        assert len(result["daily_ticker_values"]["VWRL.L"]) == 2
+
+        # Verify ticker values sum to total values
+        day_1_vusa = result["daily_ticker_values"]["VUSA.L"][0]
+        day_1_vwrl = result["daily_ticker_values"]["VWRL.L"][0]
+        assert day_1_vusa + day_1_vwrl == 1530.0
+
+        day_2_vusa = result["daily_ticker_values"]["VUSA.L"][1]
+        day_2_vwrl = result["daily_ticker_values"]["VWRL.L"][1]
+        assert day_2_vusa + day_2_vwrl == 1575.0
 
 
 class TestGetPrecomputeStatus:

@@ -7,10 +7,10 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
 import logging
+from datetime import date
 
 from .database import get_connection
 from .prices import fetch_prices_parallel, get_currencies_parallel, get_common_start_date, get_needed_currencies
-from .tickers import extract_security_and_isin
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def simulate_holdings(
     # Calculate initial holdings (before start_date)
     initial_holdings = {}
     for ticker in unique_tickers:
-        pre_trades_mask = (df["Ticker"] == ticker) & (df["Trade Date/Time"].dt.date < start_date)
+        pre_trades_mask = (df["ticker"] == ticker) & (df["Trade Date/Time"].dt.date < start_date)
         pre_trades = df[pre_trades_mask].copy()
 
         if not pre_trades.empty:
@@ -70,7 +70,7 @@ def simulate_holdings(
     for ticker in unique_tickers:
         # Get trades for this ticker from start_date onward
         ticker_trades = df[
-            (df["Ticker"] == ticker) & (df["Trade Date/Time"].dt.date >= start_date)
+            (df["ticker"] == ticker) & (df["Trade Date/Time"].dt.date >= start_date)
         ].sort_values("Trade Date/Time").copy()
 
         initial_qty = initial_holdings.get(ticker, 0.0)
@@ -132,9 +132,39 @@ def compute_daily_portfolio_values(
     return daily_values
 
 
+def compute_detailed_daily_portfolio_values(
+    holdings_data: Dict[str, np.ndarray],
+    price_data: Dict[str, np.ndarray],
+    dates: pd.DatetimeIndex
+) -> Dict[str, List[float]]:
+    """
+    Compute detailed daily portfolio values with ticker-level breakdown.
+    Returns dict with ticker values and total portfolio value.
+    Format: {ticker1: [values...], ticker2: [values...], "total_value": [values...]}
+    """
+    results: Dict[str, List[float]] = {ticker: [] for ticker in holdings_data}
+    results["total_value"] = []
+
+    for i in range(len(dates)):
+        day_total = 0.0
+        for ticker in holdings_data:
+            holding = holdings_data[ticker][i]
+            if ticker in price_data:
+                price = price_data[ticker][i]
+                ticker_value = float(np.nan_to_num(holding * price, nan=0.0))
+                results[ticker].append(ticker_value)
+                day_total += ticker_value
+            else:
+                results[ticker].append(0.0)
+
+        results["total_value"].append(float(np.nan_to_num(day_total, nan=0.0)))
+
+    return results
+
+
 def get_valid_unique_tickers(df) -> List[str]:
     """Get list of unique valid tickers from the dataframe."""
-    return df.loc[(df["Ticker"] != "Not found") & (df["Ticker"].notna()), "Ticker"].drop_duplicates().tolist()
+    return df.loc[(df["ticker"].notna()) & (df["ticker"] != ""), "ticker"].drop_duplicates().tolist()
 
 
 def calculate_portfolio_values(df) -> Optional[Dict]:
@@ -166,7 +196,7 @@ def calculate_portfolio_values(df) -> Optional[Dict]:
 
         # Get date range
         common_start = get_common_start_date(unique_tickers)
-        max_date = df["Trade Date/Time"].max().date()
+        max_date = max(df["Trade Date/Time"].max().date(), date.today())
 
         if not common_start or common_start > max_date:
             logger.error("No valid date range")
@@ -190,8 +220,8 @@ def calculate_portfolio_values(df) -> Optional[Dict]:
             unique_tickers, common_start, max_date, currencies, dates
         )
 
-        # Compute portfolio values
-        daily_values = compute_daily_portfolio_values(holdings_data, price_data, dates)
+        # Compute detailed portfolio values with ticker breakdown
+        detailed_values = compute_detailed_daily_portfolio_values(holdings_data, price_data, dates)
 
         # Cache prices that weren't fully cached
         cache_new_prices(unique_tickers, price_data, dates)
@@ -199,7 +229,8 @@ def calculate_portfolio_values(df) -> Optional[Dict]:
         return {
             "monthly_net": monthly_net,
             "daily_dates": daily_dates,
-            "daily_values": daily_values,
+            "daily_values": detailed_values["total_value"],
+            "daily_ticker_values": {k: v for k, v in detailed_values.items() if k != "total_value"}
         }
 
     except Exception as e:

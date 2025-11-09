@@ -18,6 +18,7 @@ from src.portfolio import (
     compute_monthly_net_contributions,
     simulate_holdings,
     compute_daily_portfolio_values,
+    compute_detailed_daily_portfolio_values,
     get_valid_unique_tickers,
     calculate_portfolio_values
 )
@@ -82,7 +83,7 @@ class TestHoldingsSimulation:
     def test_simulate_holdings_no_pre_start_trades(self):
         """Test holdings simulation with no pre-start trades."""
         data = {
-            'Ticker': ['VUSA.L', 'VUSA.L'],
+            'ticker': ['VUSA.L', 'VUSA.L'],
             'Trade Date/Time': pd.to_datetime(['2024-02-15', '2024-03-15']),
             'Transaction Type': ['Buy', 'Buy'],
             'Quantity': [5, 3]
@@ -102,7 +103,7 @@ class TestHoldingsSimulation:
     def test_simulate_holdings_with_pre_trades(self):
         """Test holdings simulation with pre-start trades."""
         data = {
-            'Ticker': ['VUSA.L'] * 4,
+            'ticker': ['VUSA.L'] * 4,
             'Trade Date/Time': pd.to_datetime([
                 '2024-01-10',  # Pre-start
                 '2024-01-15',  # Pre-start
@@ -126,7 +127,7 @@ class TestHoldingsSimulation:
     def test_simulate_holdings_multiple_tickers(self):
         """Test holdings simulation with multiple tickers."""
         data = {
-            'Ticker': ['VUSA.L', 'VWRL.L', 'VUSA.L', 'VWRL.L'],
+            'ticker': ['VUSA.L', 'VWRL.L', 'VUSA.L', 'VWRL.L'],
             'Trade Date/Time': pd.to_datetime(['2024-01-15', '2024-01-15', '2024-02-15', '2024-02-15']),
             'Transaction Type': ['Buy', 'Buy', 'Buy', 'Buy'],
             'Quantity': [5, 10, 3, 8]
@@ -146,7 +147,7 @@ class TestHoldingsSimulation:
     def test_simulate_holdings_daily_accumulation(self):
         """Test daily holdings accumulation over time."""
         data = {
-            'Ticker': ['VUSA.L'] * 3,
+            'ticker': ['VUSA.L'] * 3,
             'Trade Date/Time': pd.to_datetime(['2024-01-03', '2024-01-10', '2024-01-15']),
             'Transaction Type': ['Buy', 'Buy', 'Buy'],
             'Quantity': [5, 3, 2]
@@ -226,34 +227,150 @@ class TestDailyPortfolioValueCalculations:
 
 
 @pytest.mark.unit
+class TestDetailedDailyPortfolioValueCalculations:
+    """Tests for the new detailed daily portfolio value calculation function."""
+
+    def test_compute_detailed_values_single_ticker(self):
+        """Test detailed portfolio value calculation for single ticker."""
+        holdings = {
+            'VUSA.L': np.array([0, 0, 5, 5, 5])
+        }
+        price_data = {
+            'VUSA.L': np.array([100.0, 101.0, 102.0, 103.0, 104.0])
+        }
+        dates = pd.date_range('2024-01-01', '2024-01-05', freq='D')
+
+        result = compute_detailed_daily_portfolio_values(holdings, price_data, dates)
+
+        assert 'VUSA.L' in result
+        assert 'total_value' in result
+        assert len(result['VUSA.L']) == 5
+        assert len(result['total_value']) == 5
+
+        # Jan 1-2: 0, Jan 3: 5 * 102 = 510, Jan 4: 5 * 103 = 515, Jan 5: 5 * 104 = 520
+        assert result['VUSA.L'][0] == 0
+        assert result['VUSA.L'][1] == 0
+        assert result['VUSA.L'][2] == 510
+        assert result['VUSA.L'][3] == 515
+        assert result['VUSA.L'][4] == 520
+
+        # Total value should match individual ticker values
+        assert result['total_value'][0] == 0
+        assert result['total_value'][1] == 0
+        assert result['total_value'][2] == 510
+        assert result['total_value'][3] == 515
+        assert result['total_value'][4] == 520
+
+    def test_compute_detailed_values_multiple_tickers(self):
+        """Test detailed portfolio value calculation with multiple tickers."""
+        holdings = {
+            'VUSA.L': np.array([0, 5, 5, 5, 5]),
+            'VWRL.L': np.array([0, 0, 10, 10, 8])
+        }
+        price_data = {
+            'VUSA.L': np.array([100.0, 101.0, 102.0, 103.0, 104.0]),
+            'VWRL.L': np.array([50.0, 51.0, 52.0, 53.0, 54.0])
+        }
+        dates = pd.date_range('2024-01-01', '2024-01-05', freq='D')
+
+        result = compute_detailed_daily_portfolio_values(holdings, price_data, dates)
+
+        assert 'VUSA.L' in result
+        assert 'VWRL.L' in result
+        assert 'total_value' in result
+        assert len(result) == 3  # 2 tickers + total
+
+        # Verify VUSA.L values
+        assert result['VUSA.L'][0] == 0
+        assert result['VUSA.L'][1] == 505  # 5 * 101
+        assert result['VUSA.L'][2] == 510  # 5 * 102
+
+        # Verify VWRL.L values
+        assert result['VWRL.L'][0] == 0
+        assert result['VWRL.L'][1] == 0
+        assert result['VWRL.L'][2] == 520  # 10 * 52
+
+        # Verify total values match sum of individual ticker values
+        for i in range(len(dates)):
+            expected_total = result['VUSA.L'][i] + result['VWRL.L'][i]
+            assert result['total_value'][i] == expected_total
+
+    def test_compute_detailed_values_with_zero_holdings(self):
+        """Test detailed portfolio value calculation with zero holdings."""
+        holdings = {
+            'VUSA.L': np.array([0, 0, 0, 0, 0])
+        }
+        price_data = {
+            'VUSA.L': np.array([100.0, 101.0, 102.0, 103.0, 104.0])
+        }
+        dates = pd.date_range('2024-01-01', '2024-01-05', freq='D')
+
+        result = compute_detailed_daily_portfolio_values(holdings, price_data, dates)
+
+        assert 'VUSA.L' in result
+        assert 'total_value' in result
+        assert all(v == 0 for v in result['VUSA.L'])
+        assert all(v == 0 for v in result['total_value'])
+
+    def test_compute_detailed_values_missing_price_data(self):
+        """Test detailed calculation when price data is missing for some tickers."""
+        holdings = {
+            'VUSA.L': np.array([5, 5, 5]),
+            'VWRL.L': np.array([10, 10, 10])
+        }
+        # Missing VWRL.L price data
+        price_data = {
+            'VUSA.L': np.array([100.0, 101.0, 102.0])
+        }
+        dates = pd.date_range('2024-01-01', '2024-01-03', freq='D')
+
+        result = compute_detailed_daily_portfolio_values(holdings, price_data, dates)
+
+        assert 'VUSA.L' in result
+        assert 'VWRL.L' in result
+        assert 'total_value' in result
+
+        # VUSA.L should have values
+        assert result['VUSA.L'][0] == 500  # 5 * 100
+        assert result['VUSA.L'][1] == 505  # 5 * 101
+
+        # VWRL.L should have zeros (no price data)
+        assert all(v == 0 for v in result['VWRL.L'])
+
+        # Total should only include VUSA.L values
+        assert result['total_value'] == result['VUSA.L']
+
+
+@pytest.mark.unit
 class TestTickerValidation:
-    def test_get_valid_unique_tickers_removes_not_found(self):
-        """Test that tickers with 'Not found' are filtered out."""
+    def test_get_valid_unique_tickers_removes_empty(self):
+        """Test that tickers with empty values are filtered out."""
         data = {
-            'Ticker': ['VUSA.L', 'Not found', 'VWRL.L', 'Not found', 'IUIT.L']
+            'ticker': ['VUSA.L', '', 'VWRL.L', None, 'IUIT.L']
         }
         df = pd.DataFrame(data)
 
         result = get_valid_unique_tickers(df)
 
-        assert 'Not found' not in result
+        assert '' not in result
+        assert None not in result
         assert 'VUSA.L' in result
         assert 'VWRL.L' in result
         assert 'IUIT.L' in result
 
     def test_get_valid_unique_tickers_handles_empty(self):
         """Test that empty dataframe returns empty list."""
-        df = pd.DataFrame({'Ticker': []})
+        df = pd.DataFrame({'ticker': []})
 
         result = get_valid_unique_tickers(df)
 
         assert isinstance(result, list)
         assert len(result) == 0
 
-    def test_get_valid_unique_tickers_all_not_found(self):
-        """Test when all tickers are 'Not found'."""
+    def test_get_valid_unique_tickers_all_empty(self):
+        """Test when all tickers are empty/null."""
         data = {
-            'Ticker': ['Not found', 'Not found', 'Not found']
+            'ticker': ['', '', '']
         }
         df = pd.DataFrame(data)
 

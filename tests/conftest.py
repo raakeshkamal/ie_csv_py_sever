@@ -27,14 +27,10 @@ from src.database import (
     load_trades,
     export_trades_as_list,
     cache_price,
-    get_cached_prices
+    get_cached_prices,
+    save_isin_ticker_mapping
 )
-from src.tickers import (
-    extract_security_and_isin,
-    search_ticker_for_isin,
-    extract_tickers_for_df,
-    add_tickers_to_df
-)
+from src.security_parser import extract_security_and_isin
 from src.prices import (
     get_currency,
     get_currencies_parallel,
@@ -189,6 +185,17 @@ def sample_trades_df():
         'Share Price': [30.41, 31.00, 32.00],
         'Total Trade Value': [152.05, 310.00, 96.00],
         'Trade Date/Time': pd.to_datetime(['2024-01-01', '2024-02-01', '2024-03-01']),
-        'Ticker': ['VUSA.L', 'VUSA.L', 'VUSA.L']
+        'isin': ['IE00BYYHSQ67', 'IE00BYYHSQ67', 'IE00BYYHSQ67'],
+        'security_name': ['Vanguard FTSE 250 ETF Dist'] * 3
     }
     return pd.DataFrame(data)
+
+
+@pytest.fixture
+def sample_isin_mappings():
+    """Sample ISIN to ticker mappings for testing."""
+    return [
+        ("IE00BYYHSQ67", "VMID.L", "Vanguard FTSE 250 ETF Dist"),
+        ("IE00BK5BQT80", "VWRL.L", "Vanguard FTSE All-World ETF Acc"),
+    ]
+

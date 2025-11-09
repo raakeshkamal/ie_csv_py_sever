@@ -8,12 +8,12 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 
-from .database import get_connection, get_cached_prices
+from .database import get_connection, get_cached_prices, load_trades_with_tickers
 from .prices import fetch_prices_parallel, get_currencies_parallel, get_common_start_date, get_needed_currencies, convert_currency
-from .portfolio import compute_monthly_net_contributions, simulate_holdings, compute_daily_portfolio_values, get_valid_unique_tickers
+from .portfolio import compute_monthly_net_contributions, simulate_holdings, compute_daily_portfolio_values, compute_detailed_daily_portfolio_values, get_valid_unique_tickers
 import concurrent.futures
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, date
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +179,17 @@ def create_precomputed_tables(conn=None, db_path: Optional[str] = None):
             )
         """)
 
+        # Ticker daily values table (stores computed daily value per ticker)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS precomputed_ticker_daily_values (
+                date DATE,
+                ticker TEXT,
+                daily_value REAL,
+                last_updated TIMESTAMP,
+                PRIMARY KEY (date, ticker)
+            )
+        """)
+
         # Metadata table to track completion status
         conn.execute("""
             CREATE TABLE IF NOT EXISTS precompute_status (
@@ -252,7 +263,7 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
 
         # Get date range
         common_start = get_common_start_date(unique_tickers)
-        max_date = df["Trade Date/Time"].max().date()
+        max_date = max(df["Trade Date/Time"].max().date(), date.today())
 
         if not common_start or common_start > max_date:
             logger.error("No valid date range")
@@ -295,15 +306,25 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         # Simulate holdings for portfolio calculation
         holdings_data, initial_holdings = simulate_holdings(df, unique_tickers, common_start, max_date)
 
-        # Compute daily portfolio values
-        daily_values = compute_daily_portfolio_values(holdings_data, converted_prices, dates)
+        # Compute detailed daily portfolio values with ticker breakdown
+        detailed_values = compute_detailed_daily_portfolio_values(holdings_data, converted_prices, dates)
 
-        # Save precomputed daily values
+        # Save precomputed daily ticker values
+        conn.execute("DELETE FROM precomputed_ticker_daily_values")
+        for i in range(len(dates)):
+            for ticker in unique_tickers:
+                ticker_value = detailed_values[ticker][i]
+                conn.execute(
+                    "INSERT OR REPLACE INTO precomputed_ticker_daily_values (date, ticker, daily_value, last_updated) VALUES (?, ?, ?, ?)",
+                    (dates[i].strftime("%Y-%m-%d"), ticker, float(ticker_value), datetime.now())
+                )
+
+        # Save precomputed total daily values
         conn.execute("DELETE FROM precomputed_portfolio_values")
         for i in range(len(dates)):
             conn.execute(
                 "INSERT OR REPLACE INTO precomputed_portfolio_values (date, daily_value, last_updated) VALUES (?, ?, ?)",
-                (dates[i].strftime("%Y-%m-%d"), float(daily_values[i]), datetime.now())
+                (dates[i].strftime("%Y-%m-%d"), float(detailed_values["total_value"][i]), datetime.now())
             )
 
         # Compute and save monthly net contributions
@@ -322,7 +343,7 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         )
         conn.commit()
 
-        logger.info(f"Successfully precomputed {len(daily_values)} daily values and {len(monthly_net)} monthly contributions")
+        logger.info(f"Successfully precomputed {len(dates)} daily values ({len(unique_tickers)} tickers) and {len(monthly_net)} monthly contributions")
         return True
 
     except Exception as e:
@@ -381,10 +402,24 @@ def get_precomputed_portfolio_data(db_path: Optional[str] = None) -> Optional[Di
             monthly_net = [{"Month": row["month"], "Net_Value": float(row["net_value"])}
                           for _, row in monthly_df.iterrows()]
 
+        # Get ticker daily values
+        ticker_df = pd.read_sql_query(
+            "SELECT date, ticker, daily_value FROM precomputed_ticker_daily_values ORDER BY date, ticker",
+            conn
+        )
+
+        # Organize ticker values by ticker symbol
+        daily_ticker_values = {}
+        if not ticker_df.empty:
+            for ticker in ticker_df["ticker"].unique():
+                ticker_data = ticker_df[ticker_df["ticker"] == ticker]
+                daily_ticker_values[ticker] = ticker_data["daily_value"].tolist()
+
         return {
             "monthly_net": monthly_net,
             "daily_dates": daily_dates,
             "daily_values": daily_values,
+            "daily_ticker_values": daily_ticker_values,
         }
 
     except Exception as e:
@@ -451,6 +486,12 @@ def export_precomputed_data(db_path: Optional[str] = None):
             ORDER BY ticker, date
         """, conn)
 
+        # Get ticker daily values
+        ticker_daily_df = pd.read_sql_query(
+            "SELECT date, ticker, daily_value, last_updated FROM precomputed_ticker_daily_values ORDER BY date, ticker",
+            conn
+        )
+
         # Get portfolio values
         portfolio_df = pd.read_sql_query(
             "SELECT date, daily_value, last_updated FROM precomputed_portfolio_values ORDER BY date",
@@ -468,11 +509,13 @@ def export_precomputed_data(db_path: Optional[str] = None):
 
         return {
             "ticker_prices": ticker_prices_df.to_dict("records"),
+            "ticker_daily_values": ticker_daily_df.to_dict("records"),
             "portfolio_values": portfolio_df.to_dict("records"),
             "monthly_contributions": monthly_df.to_dict("records"),
             "status": status,
             "count": {
                 "ticker_prices": len(ticker_prices_df),
+                "ticker_daily_values": len(ticker_daily_df),
                 "portfolio_values": len(portfolio_df),
                 "monthly_contributions": len(monthly_df)
             }

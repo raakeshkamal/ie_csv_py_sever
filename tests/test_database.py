@@ -23,7 +23,9 @@ from src.database import (
     load_trades,
     export_trades_as_list,
     cache_price,
-    get_cached_prices
+    get_cached_prices,
+    create_isin_ticker_mapping_table,
+    save_isin_ticker_mapping
 )
 from src.background_processor import create_precomputed_tables
 
@@ -188,18 +190,30 @@ class TestTradesCRUD:
         """Test exporting trades as a list of dictionaries."""
         df = pd.DataFrame({
             'Security / ISIN': ['Vanguard ETF / ISIN IE00BYYHSQ67'],
-            'Ticker': ['VUSA.L'],
-            'Trade Date/Time': [pd.Timestamp('2024-01-01 12:00:00')],
+            'Transaction Type': ['Buy'],
             'Quantity': [10],
-            'Share Price': [100.0]
+            'Share Price': [100.0],
+            'Total Trade Value': [1000.0],
+            'Trade Date/Time': [pd.Timestamp('2024-01-01 12:00:00')],
+            'isin': ['IE00BYYHSQ67'],
+            'security_name': ['Vanguard ETF']
         })
 
+        # Add ISIN mapping for the test
+        create_isin_ticker_mapping_table(db_path=temp_db_path)
+        save_isin_ticker_mapping(
+            'IE00BYYHSQ67', 'VUSA.L', None,
+            db_path=temp_db_path
+        )
+
         save_trades(df, db_path=temp_db_path)
+
         trades_list = export_trades_as_list(temp_db_path)
 
         assert isinstance(trades_list, list)
         assert len(trades_list) == 1
-        assert trades_list[0]['Ticker'] == 'VUSA.L'
+        assert trades_list[0]['ticker'] == 'VUSA.L'
+        assert trades_list[0]['isin'] == 'IE00BYYHSQ67'
         assert trades_list[0]['Quantity'] == 10
         # Verify datetime is serialized
         assert isinstance(trades_list[0]['Trade Date/Time'], str)
