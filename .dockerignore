@@ -1,0 +1,58 @@
+# Version control
+.git
+.gitignore
+.gitlab-ci.yml
+.github/
+
+# Python cache / byte-code
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+.envrc
+.venv/
+conda-env/
+
+# Build / distribution artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+site/
+
+# Database files
+database.db
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.bak
+
+# Sensitive configuration
+.env
+*.pem
+*.key
+
+# Trading statements folder (if it contains user data)
+trading-statements/
+
+# Miscellaneous temporary files
+tmp/
+temp/
+*.log

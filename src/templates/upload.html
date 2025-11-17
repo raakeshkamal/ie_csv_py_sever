@@ -98,7 +98,13 @@
             const responseText = xhr.responseText;
 
             try {
-                const response = JSON.parse(responseText);
+                // Debug logging to help identify JSON parsing issues
+                console.log('Raw response text length:', responseText.length);
+                console.log('First 20 chars:', JSON.stringify(responseText.substring(0, 20)));
+
+                // Trim whitespace and BOM characters before parsing
+                const trimmedText = responseText.trim();
+                const response = JSON.parse(trimmedText);
                 if (response.success) {
                     let html = `
                         <div class="success">

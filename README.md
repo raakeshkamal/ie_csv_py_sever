@@ -262,7 +262,96 @@ Charts are interactive (zoom, hover) via Plotly and rendered client-side from se
 
 ### Extraction Process
 For each unique "Security / ISIN", the system:
-1. Parses security name and ISIN using regex pattern: `(.*?)/\s*ISIN\s+([A-Z]{2}[A-Z0-9]{9}[0-9])`
+1. Parses security name and ISIN using regex pattern: `(# InvestEngine CSV Server
+
+A Python FastAPI server for uploading and processing InvestEngine trading statement CSV files. It merges CSV batches into a SQLite database, enriches securities with ticker symbols via Yahoo Finance, fetches historical prices, and provides portfolio visualisations (monthly net contributions and daily portfolio value).
+
+## Features
+- Web interface for batch CSV upload (FastAPI + HTMX)
+- Automatic CSV parsing, cleaning and merging
+- ISIN → ticker mapping (Yahoo Finance API) with LSE and ETF handling
+- Multi‑currency support with FX rate conversion to GBP
+- Cached price and FX data in SQLite for fast subsequent queries
+- Background pre‑computation of ticker prices and portfolio values
+- API endpoints for data export and portfolio calculations
+- Basic HTTP authentication (environment‑configurable)
+- Docker Compose + Caddy reverse‑proxy for HTTPS deployment
+
+## Project Structure
+```
+.
+├── src/                 # Application source code
+│   ├── main.py          # FastAPI app and routes
+│   ├── merge_csv.py     # CSV merging logic
+│   ├── security_parser.py
+│   ├── tickers.py       # Ticker extraction
+│   ├── prices.py        # Price fetching & FX conversion
+│   ├── portfolio.py     # Portfolio calculations
+│   ├── background_processor.py
+│   ├── database.py      # SQLite helper functions
+│   └── templates/upload.html
+├── tests/               # pytest test suite
+├── docker-compose.yml
+├── Caddyfile
+├── pyproject.toml
+└── README.md           # This file
+```
+
+## Setup
+1. Install **UV** (or use pip/conda):
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   # or: brew install uv
+   ```
+2. Install dependencies:
+   ```bash
+   uv sync
+   ```
+3. (Optional) Set authentication credentials:
+   ```bash
+   export AUTH_USERNAME=admin
+   export AUTH_PASSWORD=password
+   ```
+
+## Running the Server
+```bash
+uv run uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+```
+Open `http://localhost:8000` in a browser, reset the database via `/reset/`, then upload CSV files.
+
+## API Endpoints
+- `GET /` – upload form (HTML)
+- `POST /reset/` – clear database
+- `POST /upload/` – upload CSV batch (must call `/reset/` first)
+- `GET /portfolio-values/` – monthly net contributions & daily portfolio values (pre‑computed when possible)
+- `GET /export/trades/` – JSON export of all trades
+- `GET /export/prices/` – JSON export of ticker prices (original & GBP)
+- `POST /mapping/` – create/update ISIN → ticker mappings (JSON body)
+- `GET /mapping/` – list all mappings
+
+## Testing
+```bash
+# Install test extras
+uv sync --extra test
+# Run all tests with coverage
+pytest --cov=src
+```
+The `tests/` directory contains unit, integration and background‑processor tests. Use markers to run subsets, e.g. `pytest -m unit`.
+
+## Docker Compose (Production)
+```bash
+docker-compose up -d
+```
+Configure `Caddyfile` with your server IP and set strong `AUTH_USERNAME`/`AUTH_PASSWORD` environment variables.
+
+## Security Notes
+- Change default credentials before production use.
+- HTTPS is provided via Caddy (self‑signed for IP addresses).
+- Security headers (HSTS, X‑Content‑Type‑Options, etc.) are enabled.
+
+---
+Generated with Claude Code.
+?)/\s*ISIN\s+([A-Z]{2}[A-Z0-9]{9}[0-9])`
 2. Searches Yahoo Finance API by security name (primary method)
 3. Prefers LSE exchange (.L suffix) and ETF/Equity quote types
 4. Falls back to ISIN-based search if name search yields no results
