@@ -3,17 +3,29 @@ Background processor module for precomputing yfinance data.
 Handles asynchronous collection of ticker prices, FX rates, and portfolio values.
 """
 
-import logging
-from typing import Dict, List, Optional, Tuple
-import pandas as pd
-import numpy as np
-
-from .database import get_connection, get_cached_prices, load_trades_with_tickers
-from .prices import fetch_prices_parallel, get_currencies_parallel, get_common_start_date, get_needed_currencies, convert_currency
-from .portfolio import compute_monthly_net_contributions, simulate_holdings, compute_daily_portfolio_values, compute_detailed_daily_portfolio_values, get_valid_unique_tickers
 import concurrent.futures
+import json
+import logging
+from datetime import date, datetime
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
 import yfinance as yf
-from datetime import datetime, date
+
+from .database import get_cached_prices, get_connection
+from .portfolio import (
+    compute_detailed_daily_portfolio_values,
+    compute_monthly_net_contributions,
+    get_valid_unique_tickers,
+    simulate_holdings,
+)
+from .portfolio_stats import calculate_time_weighted_return
+from .prices import (
+    convert_currency,
+    get_common_start_date,
+    get_currencies_parallel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +35,7 @@ def fetch_original_prices_parallel(
     start_date,
     end_date,
     currencies: Dict[str, str],
-    dates: pd.DatetimeIndex
+    dates: pd.DatetimeIndex,
 ) -> Dict[str, np.ndarray]:
     """
     Fetch original prices (in reported currency) for multiple tickers in parallel.
@@ -40,7 +52,7 @@ def fetch_original_prices_parallel(
                 start_date,
                 end_date,
                 currencies.get(ticker, "GBP"),
-                dates
+                dates,
             ): ticker
             for ticker in tickers
         }
@@ -58,11 +70,7 @@ def fetch_original_prices_parallel(
 
 
 def fetch_original_history(
-    ticker: str,
-    start_date,
-    end_date,
-    reported_currency: str,
-    dates: pd.DatetimeIndex
+    ticker: str, start_date, end_date, reported_currency: str, dates: pd.DatetimeIndex
 ) -> Tuple[str, np.ndarray]:
     """
     Fetch historical prices without converting to GBP.
@@ -76,16 +84,22 @@ def fetch_original_history(
         date_list = [d.date() for d in dates]
 
         if cached is not None:
-            cached_prices = cached.reindex(date_list).ffill()["close"].fillna(0.0).values
+            cached_prices = (
+                cached.reindex(date_list).ffill()["close"].fillna(0.0).values
+            )
             non_zero_count = np.count_nonzero(cached_prices > 0)
-            logger.info(f"Cached prices for {ticker}: {non_zero_count} non-zero out of {len(cached_prices)}")
+            logger.info(
+                f"Cached prices for {ticker}: {non_zero_count} non-zero out of {len(cached_prices)}"
+            )
             if non_zero_count == len(cached_prices):
                 return ticker, cached_prices
         else:
             cached_prices = np.zeros(len(dates))
 
         # Fetch from yfinance if not fully cached
-        logger.info(f"Fetching original history for {ticker} from {start_date} to {end_date}")
+        logger.info(
+            f"Fetching original history for {ticker} from {start_date} to {end_date}"
+        )
         yf_ticker = yf.Ticker(ticker)
         hist = yf_ticker.history(start=start_date, end=end_date + pd.Timedelta(days=1))
 
@@ -103,7 +117,9 @@ def fetch_original_history(
         # Get prices and forward-fill missing days
         prices = hist["Close"].reindex(dates).ffill().fillna(0.0)
         non_zero = (prices > 0).sum()
-        logger.info(f"Original prices for {ticker}: {non_zero} non-zero out of {len(prices)}")
+        logger.info(
+            f"Original prices for {ticker}: {non_zero} non-zero out of {len(prices)}"
+        )
 
         # Do NOT convert currency here - return original prices
         return ticker, prices.values
@@ -117,7 +133,7 @@ def convert_prices_to_gbp(
     original_prices: Dict[str, np.ndarray],
     currencies: Dict[str, str],
     dates: pd.DatetimeIndex,
-    tickers: List[str]
+    tickers: List[str],
 ) -> Dict[str, np.ndarray]:
     """
     Convert original prices to GBP.
@@ -134,7 +150,9 @@ def convert_prices_to_gbp(
         reported_currency = currencies.get(ticker, "GBP")
 
         # Convert currency (this handles LSE GBp → GBP conversion)
-        converted = convert_currency(original_price_series, reported_currency, ticker, dates)
+        converted = convert_currency(
+            original_price_series, reported_currency, ticker, dates
+        )
         converted_prices[ticker] = converted.fillna(0.0).values
 
     return converted_prices
@@ -142,7 +160,7 @@ def convert_prices_to_gbp(
 
 def create_precomputed_tables(conn=None, db_path: Optional[str] = None):
     """Create tables for precomputed portfolio data and metadata."""
-    from .database import get_connection
+
     close_conn = False
     if conn is None:
         conn = get_connection(db_path)
@@ -190,6 +208,21 @@ def create_precomputed_tables(conn=None, db_path: Optional[str] = None):
             )
         """)
 
+        # TWR metrics table (stores calculated TWR metrics for the entire period)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS precomputed_twr_metrics (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                twr REAL,
+                total_return REAL,
+                annualized_return REAL,
+                sub_periods TEXT,
+                period_start TEXT,
+                period_end TEXT,
+                total_days INTEGER,
+                last_updated TIMESTAMP
+            )
+        """)
+
         # Metadata table to track completion status
         conn.execute("""
             CREATE TABLE IF NOT EXISTS precompute_status (
@@ -209,12 +242,47 @@ def create_precomputed_tables(conn=None, db_path: Optional[str] = None):
             conn.close()
 
 
+def extract_cash_flow_events(df: pd.DataFrame) -> List[Dict]:
+    """
+    Extract cash flow events by computing daily net flows from buy/sell trades.
+    Net buy (buys - sells) treated as inflow proxy, net sell as outflow.
+    Returns sorted list of {'date': 'YYYY-MM-DD', 'net_amount': float} for significant flows.
+    """
+    if df.empty:
+        return []
+
+    # Ensure datetime
+    df = df.copy()
+    df["trade_date"] = df["Trade Date/Time"].dt.date
+
+    # Group by trade_date and compute net: sum buys - sum sells
+    def compute_net(group):
+        buys = group[group["Transaction Type"] == "Buy"]["Total Trade Value"].sum()
+        sells = group[group["Transaction Type"] == "Sell"]["Total Trade Value"].sum()
+        return buys - sells
+
+    daily_net = (
+        df.groupby("trade_date")
+        .apply(compute_net, include_groups=False)
+        .reset_index(name="net_amount")
+    )
+
+    events = []
+    for _, row in daily_net.iterrows():
+        net = row["net_amount"]
+        if abs(net) > 1.0:  # threshold for significant flow
+            date_str = row["trade_date"].isoformat()
+            events.append({"date": date_str, "net_amount": float(net)})
+
+    return sorted(events, key=lambda x: x["date"])
+
+
 def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> bool:
     """
     Precompute portfolio values and monthly contributions in the background.
     Returns True if successful, False otherwise.
     """
-    from .database import get_connection
+
     close_conn = False
     if conn is None:
         conn = get_connection(db_path)
@@ -228,7 +296,7 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
     try:
         cursor = conn.execute(
             "INSERT INTO precompute_status (status, started_at) VALUES (?, ?)",
-            ("in_progress", datetime.now())
+            ("in_progress", datetime.now()),
         )
         status_id = cursor.lastrowid
         conn.commit()
@@ -247,7 +315,7 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
             logger.error("No valid tickers found in trades")
             conn.execute(
                 "UPDATE precompute_status SET status = ?, last_error = ? WHERE id = ?",
-                ("failed", "No valid tickers found", status_id)
+                ("failed", "No valid tickers found", status_id),
             )
             conn.commit()
             return False
@@ -257,7 +325,7 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         # Update status with ticker count
         conn.execute(
             "UPDATE precompute_status SET total_tickers = ? WHERE id = ?",
-            (len(unique_tickers), status_id)
+            (len(unique_tickers), status_id),
         )
         conn.commit()
 
@@ -269,7 +337,7 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
             logger.error("No valid date range")
             conn.execute(
                 "UPDATE precompute_status SET status = ?, last_error = ? WHERE id = ?",
-                ("failed", "Invalid date range", status_id)
+                ("failed", "Invalid date range", status_id),
             )
             conn.commit()
             return False
@@ -285,7 +353,9 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         )
 
         # Convert prices to GBP
-        converted_prices = convert_prices_to_gbp(original_prices, currencies, dates, unique_tickers)
+        converted_prices = convert_prices_to_gbp(
+            original_prices, currencies, dates, unique_tickers
+        )
 
         # Store both original and converted prices
         conn.execute("DELETE FROM precomputed_ticker_prices")
@@ -300,14 +370,25 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
                         """INSERT OR REPLACE INTO precomputed_ticker_prices
                            (ticker, date, original_currency, original_price, converted_price_gbp, last_updated)
                            VALUES (?, ?, ?, ?, ?, ?)""",
-                        (ticker, dates[i].strftime("%Y-%m-%d"), currency, float(orig_price), float(conv_price), datetime.now())
+                        (
+                            ticker,
+                            dates[i].strftime("%Y-%m-%d"),
+                            currency,
+                            float(orig_price),
+                            float(conv_price),
+                            datetime.now(),
+                        ),
                     )
 
         # Simulate holdings for portfolio calculation
-        holdings_data, initial_holdings = simulate_holdings(df, unique_tickers, common_start, max_date)
+        holdings_data, initial_holdings = simulate_holdings(
+            df, unique_tickers, common_start, max_date
+        )
 
         # Compute detailed daily portfolio values with ticker breakdown
-        detailed_values = compute_detailed_daily_portfolio_values(holdings_data, converted_prices, dates)
+        detailed_values = compute_detailed_daily_portfolio_values(
+            holdings_data, converted_prices, dates
+        )
 
         # Save precomputed daily ticker values
         conn.execute("DELETE FROM precomputed_ticker_daily_values")
@@ -316,7 +397,12 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
                 ticker_value = detailed_values[ticker][i]
                 conn.execute(
                     "INSERT OR REPLACE INTO precomputed_ticker_daily_values (date, ticker, daily_value, last_updated) VALUES (?, ?, ?, ?)",
-                    (dates[i].strftime("%Y-%m-%d"), ticker, float(ticker_value), datetime.now())
+                    (
+                        dates[i].strftime("%Y-%m-%d"),
+                        ticker,
+                        float(ticker_value),
+                        datetime.now(),
+                    ),
                 )
 
         # Save precomputed total daily values
@@ -324,7 +410,11 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         for i in range(len(dates)):
             conn.execute(
                 "INSERT OR REPLACE INTO precomputed_portfolio_values (date, daily_value, last_updated) VALUES (?, ?, ?)",
-                (dates[i].strftime("%Y-%m-%d"), float(detailed_values["total_value"][i]), datetime.now())
+                (
+                    dates[i].strftime("%Y-%m-%d"),
+                    float(detailed_values["total_value"][i]),
+                    datetime.now(),
+                ),
             )
 
         # Compute and save monthly net contributions
@@ -333,17 +423,51 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         for item in monthly_net:
             conn.execute(
                 "INSERT OR REPLACE INTO precomputed_monthly_contributions (month, net_value, last_updated) VALUES (?, ?, ?)",
-                (item["Month"], float(item["Net_Value"]), datetime.now())
+                (item["Month"], float(item["Net_Value"]), datetime.now()),
+            )
+
+        # Compute cash flow events for exact TWR sub-periods
+        cash_flow_events = extract_cash_flow_events(df)
+
+        # Calculate TWR metrics
+        daily_dates_str = [d.strftime("%Y-%m-%d") for d in dates]
+        twr_result = calculate_time_weighted_return(
+            daily_dates_str,
+            detailed_values["total_value"],
+            monthly_net,
+            cash_flow_events,
+        )
+
+        # Store TWR metrics (single row with id=1)
+        conn.execute("DELETE FROM precomputed_twr_metrics")
+        if twr_result:
+            conn.execute(
+                """INSERT INTO precomputed_twr_metrics
+                   (id, twr, total_return, annualized_return, sub_periods, period_start, period_end, total_days, last_updated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    1,
+                    twr_result["time_weighted_return"],
+                    twr_result["total_return"],
+                    twr_result["annualized_return"],
+                    json.dumps(twr_result["sub_periods"]),
+                    twr_result["period_start"],
+                    twr_result["period_end"],
+                    twr_result["total_days"],
+                    datetime.now(),
+                ),
             )
 
         # Update status to completed
         conn.execute(
             "UPDATE precompute_status SET status = ?, completed_at = ? WHERE id = ?",
-            ("completed", datetime.now(), status_id)
+            ("completed", datetime.now(), status_id),
         )
         conn.commit()
 
-        logger.info(f"Successfully precomputed {len(dates)} daily values ({len(unique_tickers)} tickers) and {len(monthly_net)} monthly contributions")
+        logger.info(
+            f"Successfully precomputed {len(dates)} daily values ({len(unique_tickers)} tickers) and {len(monthly_net)} monthly contributions"
+        )
         return True
 
     except Exception as e:
@@ -351,7 +475,7 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         if status_id and conn:
             conn.execute(
                 "UPDATE precompute_status SET status = ?, last_error = ? WHERE id = ?",
-                ("failed", str(e), status_id)
+                ("failed", str(e), status_id),
             )
             conn.commit()
         return False
@@ -366,7 +490,7 @@ def get_precomputed_portfolio_data(db_path: Optional[str] = None) -> Optional[Di
     Retrieve precomputed portfolio data from database.
     Returns dict with monthly_net and daily values, or None if not available.
     """
-    from .database import get_connection
+
     conn = get_connection(db_path)
     try:
         # Check if data exists and is fresh (within last 24 hours)
@@ -383,7 +507,7 @@ def get_precomputed_portfolio_data(db_path: Optional[str] = None) -> Optional[Di
         # Get daily values
         daily_df = pd.read_sql_query(
             "SELECT date, daily_value FROM precomputed_portfolio_values ORDER BY date",
-            conn
+            conn,
         )
         if daily_df.empty:
             return None
@@ -395,17 +519,19 @@ def get_precomputed_portfolio_data(db_path: Optional[str] = None) -> Optional[Di
         # Get monthly contributions
         monthly_df = pd.read_sql_query(
             "SELECT month, net_value FROM precomputed_monthly_contributions ORDER BY month",
-            conn
+            conn,
         )
         monthly_net = []
         if not monthly_df.empty:
-            monthly_net = [{"Month": row["month"], "Net_Value": float(row["net_value"])}
-                          for _, row in monthly_df.iterrows()]
+            monthly_net = [
+                {"Month": row["month"], "Net_Value": float(row["net_value"])}
+                for _, row in monthly_df.iterrows()
+            ]
 
         # Get ticker daily values
         ticker_df = pd.read_sql_query(
             "SELECT date, ticker, daily_value FROM precomputed_ticker_daily_values ORDER BY date, ticker",
-            conn
+            conn,
         )
 
         # Organize ticker values by ticker symbol
@@ -415,11 +541,30 @@ def get_precomputed_portfolio_data(db_path: Optional[str] = None) -> Optional[Di
                 ticker_data = ticker_df[ticker_df["ticker"] == ticker]
                 daily_ticker_values[ticker] = ticker_data["daily_value"].tolist()
 
+        # Get TWR metrics
+        twr_df = pd.read_sql_query(
+            "SELECT twr, total_return, annualized_return, sub_periods, period_start, period_end, total_days "
+            + "FROM precomputed_twr_metrics ORDER BY last_updated DESC LIMIT 1",
+            conn,
+        )
+        twr_metrics = {}
+        if not twr_df.empty:
+            twr_metrics = {
+                "time_weighted_return": float(twr_df.iloc[0]["twr"]),
+                "total_return": float(twr_df.iloc[0]["total_return"]),
+                "annualized_return": float(twr_df.iloc[0]["annualized_return"]),
+                "sub_periods": json.loads(twr_df.iloc[0]["sub_periods"]),
+                "period_start": twr_df.iloc[0]["period_start"],
+                "period_end": twr_df.iloc[0]["period_end"],
+                "total_days": int(twr_df.iloc[0]["total_days"]),
+            }
+
         return {
             "monthly_net": monthly_net,
             "daily_dates": daily_dates,
             "daily_values": daily_values,
             "daily_ticker_values": daily_ticker_values,
+            "twr_metrics": twr_metrics,
         }
 
     except Exception as e:
@@ -435,7 +580,7 @@ def get_precompute_status(db_path: Optional[str] = None) -> Dict:
     Get the current precomputation status.
     Returns dict with status information.
     """
-    from .database import get_connection
+
     conn = get_connection(db_path)
     try:
         cursor = conn.execute("""
@@ -453,7 +598,7 @@ def get_precompute_status(db_path: Optional[str] = None) -> Dict:
                 "completed_at": row[2],
                 "total_tickers": row[3],
                 "last_error": row[4],
-                "has_data": True
+                "has_data": True,
             }
         else:
             return {"status": "not_started", "has_data": False}
@@ -471,8 +616,6 @@ def export_precomputed_data(db_path: Optional[str] = None):
     Export all precomputed data as JSON.
     Returns dict with ticker prices, portfolio values, monthly contributions, and status.
     """
-    from .database import get_connection
-    import json
 
     conn = get_connection(db_path)
     try:
@@ -480,28 +623,31 @@ def export_precomputed_data(db_path: Optional[str] = None):
         create_precomputed_tables(conn, db_path)
 
         # Get ticker prices with both currencies
-        ticker_prices_df = pd.read_sql_query("""
+        ticker_prices_df = pd.read_sql_query(
+            """
             SELECT ticker, date, original_currency, original_price, converted_price_gbp, last_updated
             FROM precomputed_ticker_prices
             ORDER BY ticker, date
-        """, conn)
+        """,
+            conn,
+        )
 
         # Get ticker daily values
         ticker_daily_df = pd.read_sql_query(
             "SELECT date, ticker, daily_value, last_updated FROM precomputed_ticker_daily_values ORDER BY date, ticker",
-            conn
+            conn,
         )
 
         # Get portfolio values
         portfolio_df = pd.read_sql_query(
             "SELECT date, daily_value, last_updated FROM precomputed_portfolio_values ORDER BY date",
-            conn
+            conn,
         )
 
         # Get monthly contributions
         monthly_df = pd.read_sql_query(
             "SELECT month, net_value, last_updated FROM precomputed_monthly_contributions ORDER BY month",
-            conn
+            conn,
         )
 
         # Get status
@@ -517,8 +663,8 @@ def export_precomputed_data(db_path: Optional[str] = None):
                 "ticker_prices": len(ticker_prices_df),
                 "ticker_daily_values": len(ticker_daily_df),
                 "portfolio_values": len(portfolio_df),
-                "monthly_contributions": len(monthly_df)
-            }
+                "monthly_contributions": len(monthly_df),
+            },
         }
 
     except Exception as e:
