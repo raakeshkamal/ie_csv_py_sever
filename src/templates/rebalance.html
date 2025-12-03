@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rebalance Portfolio</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin-bottom: 20px;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        input[type="number"], input[type="range"] {
+            margin: 5px;
+            padding: 5px;
+        }
+        .slider-container {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+        .slider-label {
+            width: 150px;
+            font-weight: bold;
+        }
+        .slider-value {
+            width: 60px;
+            text-align: right;
+        }
+        .manual-input {
+            width: 80px;
+            margin-left: 10px;
+        }
+        .browse-button {
+            background: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            display: inline-block;
+            font-size: 14px;
+            text-decoration: none;
+            margin: 5px;
+        }
+        .browse-button:hover {
+            background: #0056b3;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .success { background-color: #d4edda; color: #155724; }
+        .error { background-color: #f8d7da; color: #721c24; }
+        .investment-positive { color: green; font-weight: bold; }
+        .investment-zero { color: gray; }
+    </style>
+</head>
+<body>
+    <h1>Rebalance Portfolio</h1>
+    <p>Calculate investments to achieve target allocations with new capital.</p>
+    
+    <a href="/" class="browse-button">Back to Upload</a>
+    <a href="/mappings/" class="browse-button">Manage Mappings</a><br><br>
+    
+    <button id="load-data-btn" class="browse-button" hx-get="/rebalance/data/" hx-target="#portfolio-section" hx-swap="innerHTML"
+            hx-on::after-request="handleDataLoad(event)">Load Portfolio Data</button><br><br>
+    
+    <div id="portfolio-section">
+        <p>Loading current portfolio...</p>
+    </div>
+    
+    <div id="new-capital-section" style="display: none;">
+        <h2>New Capital</h2>
+        <label>New Investment Amount: </label>
+        <input type="number" id="new-capital" value="0" min="0" step="0.01" style="width: 150px;">
+        <br><br>
+    </div>
+    
+    <div id="sliders-section" style="display: none;">
+        <h2>Target Allocations (%)</h2>
+        <p>Adjust sliders or enter values manually to set targets. Total will always sum to 100%.</p>
+        <div id="sliders-container"></div>
+        <p><strong>Total: <span id="total-pct">100.00</span>%</strong></p>
+    </div>
+    
+    <div id="results-section" style="display: none;">
+        <h2>Rebalancing Results</h2>
+        <table id="results-table">
+            <thead>
+                <tr>
+                    <th>Ticker</th>
+                    <th>Current Value</th>
+                    <th>Target Value</th>
+                    <th>Investment Needed</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+        <p><strong>Total Investment: <span id="total-investment">0.00</span></strong></p>
+    </div>
+    
+    <div id="error-section"></div>
+    
+    <script>
+        let currentData = null;
+        
+        function handleDataLoad(event) {
+            const target = document.getElementById('portfolio-section');
+            const xhr = event.detail.xhr;
+            try {
+                const response = JSON.parse(xhr.responseText);
+                if (response.success) {
+                    currentData = response;
+                    displayCurrentPortfolio(response);
+                    setupSections();
+                    // Initialize sliders with current allocations
+                    initializeSliders();
+                } else {
+                    target.innerHTML = `<div class="error"><h2>Error: ${response.error}</h2></div>`;
+                }
+            } catch (e) {
+                target.innerHTML = '<div class="error"><h2>Unexpected error loading data</h2></div>';
+            }
+        }
+        
+        function displayCurrentPortfolio(data) {
+            const section = document.getElementById('portfolio-section');
+            if (data.tickers.length === 0) {
+                section.innerHTML = '<p>No invested tickers found. Upload trades first.</p>';
+                return;
+            }
+            let html = `
+                <h2>Current Portfolio (Total: £${data.total_value.toFixed(2)})</h2>
+                <table>
+                    <thead><tr><th>Ticker</th><th>Current Value</th><th>Current Allocation</th></tr></thead>
+                    <tbody>
+            `;
+            data.tickers.forEach(item => {
+                html += `<tr><td>${item.ticker}</td><td>£${item.current_value.toFixed(2)}</td><td>${item.current_allocation_pct.toFixed(2)}%</td></tr>`;
+            });
+            html += '</tbody></table>';
+            section.innerHTML = html;
+        }
+        
+        function setupSections() {
+            document.getElementById('new-capital-section').style.display = 'block';
+            document.getElementById('sliders-section').style.display = 'block';
+            
+            // Listen for changes
+            document.getElementById('new-capital').addEventListener('input', calculateRebalance);
+        }
+        
+        function initializeSliders() {
+            const container = document.getElementById('sliders-container');
+            let html = '';
+            let totalPct = 0;
+            currentData.tickers.forEach(item => {
+                const initialPct = item.current_allocation_pct;
+                totalPct += initialPct;
+                html += `
+                    <div class="slider-container">
+                        <span class="slider-label">${item.ticker}:</span>
+                        <input type="range" id="slider-${item.ticker}" min="0" max="100" value="${initialPct}" 
+                               oninput="handleSliderChange('${item.ticker}', this.value);">
+                        <input type="number" id="input-${item.ticker}" class="manual-input" min="0" max="100" step="0.01" value="${initialPct}" 
+                               onchange="updateFromInput('${item.ticker}', this.value);" style="width: 80px;">
+                        <span class="slider-value" id="value-${item.ticker}">${initialPct.toFixed(2)}%</span>
+                    </div>
+                `;
+            });
+            container.innerHTML = html;
+            document.getElementById('total-pct').textContent = totalPct.toFixed(2);
+        }
+        
+        function handleSliderChange(ticker, value) {
+            const input = document.getElementById(`input-${ticker}`);
+            input.value = parseFloat(value);
+            updateSliderValue(ticker, value);
+            updateSliders(ticker);
+            calculateRebalance();
+        }
+        
+        function updateFromInput(ticker, value) {
+            const slider = document.getElementById(`slider-${ticker}`);
+            slider.value = value;
+            updateSliderValue(ticker, value);
+            updateSliders(ticker);
+            calculateRebalance();
+        }
+        
+        function updateSliderValue(ticker, value) {
+            document.getElementById(`value-${ticker}`).textContent = parseFloat(value).toFixed(2) + '%';
+        }
+        
+        function updateSliders(changedTicker) {
+            // Get current values
+            const sliders = {};
+            let total = 0;
+            currentData.tickers.forEach(item => {
+                const slider = document.getElementById(`slider-${item.ticker}`);
+                const val = parseFloat(slider.value);
+                sliders[item.ticker] = val;
+                total += val;
+            });
+            
+            if (Math.abs(total - 100) > 0.01) {
+                const changedVal = sliders[changedTicker];
+                let sumOthers = total - changedVal;
+                if (sumOthers <= 0) {
+                    // If sum others is zero, set all others to 0
+                    currentData.tickers.forEach(item => {
+                        if (item.ticker !== changedTicker) {
+                            const slider = document.getElementById(`slider-${item.ticker}`);
+                            const input = document.getElementById(`input-${item.ticker}`);
+                            const newVal = 0;
+                            slider.value = newVal;
+                            input.value = newVal;
+                            updateSliderValue(item.ticker, newVal);
+                        }
+                    });
+                } else {
+                    const delta = 100 - total;
+                    currentData.tickers.forEach(item => {
+                        if (item.ticker !== changedTicker) {
+                            const otherVal = sliders[item.ticker];
+                            const proportion = otherVal / sumOthers;
+                            const adjustment = delta * proportion;
+                            const newVal = Math.max(0, otherVal + adjustment);
+                            const slider = document.getElementById(`slider-${item.ticker}`);
+                            const input = document.getElementById(`input-${item.ticker}`);
+                            slider.value = newVal;
+                            input.value = newVal;
+                            updateSliderValue(item.ticker, newVal);
+                        }
+                    });
+                }
+            }
+            
+            // Recalculate total after adjustments
+            total = 0;
+            currentData.tickers.forEach(item => {
+                total += parseFloat(document.getElementById(`slider-${item.ticker}`).value);
+            });
+            document.getElementById('total-pct').textContent = total.toFixed(2);
+        }
+        
+        function calculateRebalance() {
+            if (!currentData) return;
+            
+            const newCapital = parseFloat(document.getElementById('new-capital').value) || 0;
+            const targetAllocations = {};
+            currentData.tickers.forEach(item => {
+                const slider = document.getElementById(`slider-${item.ticker}`);
+                targetAllocations[item.ticker] = parseFloat(slider.value);
+            });
+            
+            const body = {
+                new_capital: newCapital,
+                target_allocations: targetAllocations,
+                current_tickers: currentData.tickers
+            };
+            
+            fetch('/rebalance/calculate/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    displayResults(data);
+                    document.getElementById('results-section').style.display = 'block';
+                } else {
+                    document.getElementById('error-section').innerHTML = `<div class="error">Calculation error: ${data.error}</div>`;
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                document.getElementById('error-section').innerHTML = '<div class="error">Failed to calculate rebalance</div>';
+            });
+        }
+        
+        function displayResults(data) {
+            const tbody = document.querySelector('#results-table tbody');
+            tbody.innerHTML = '';
+            let totalInv = 0;
+            data.investments.forEach(inv => {
+                const row = tbody.insertRow();
+                row.innerHTML = `
+                    <td>${inv.ticker}</td>
+                    <td>£${inv.current_value.toFixed(2)}</td>
+                    <td>£${inv.target_value.toFixed(2)}</td>
+                    <td class="${inv.investment_amount > 0 ? 'investment-positive' : 'investment-zero'}">£${inv.investment_amount.toFixed(2)}</td>
+                `;
+                totalInv += inv.investment_amount;
+            });
+            document.getElementById('total-investment').textContent = totalInv.toFixed(2);
+        }
+        
+        // Initial load
+        document.addEventListener('DOMContentLoaded', function() {
+            // Auto-load data
+            const loadBtn = document.getElementById('load-data-btn');
+            if (loadBtn) {
+                htmx.trigger(loadBtn, 'click');
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,47 +1,46 @@
 import logging
-from typing import List, Dict, Any
+import os
+from datetime import date
+from typing import Any, Dict, List
 
 import pandas as pd
 from fastapi import (
     BackgroundTasks,
+    Body,
+    Depends,
     FastAPI,
     File,
     Request,
     UploadFile,
-    HTTPException,
-    Depends,
-    Security,
 )
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from datetime import date
+from fastapi.templating import Jinja2Templates
 
-from .merge_csv import merge_csv_files
+from .background_processor import (
+    create_precomputed_tables,
+    export_precomputed_data,
+    get_precomputed_portfolio_data,
+    precompute_portfolio_data,
+)
 from .database import (
-    has_trades_data,
-    reset_database,
-    save_trades,
-    export_trades_as_list,
-    create_prices_table,
-    load_trades,
-    load_trades_with_tickers,
     create_isin_ticker_mapping_table,
-    save_isin_ticker_mapping,
+    create_prices_table,
+    export_trades_as_list,
     get_all_isin_ticker_mappings,
-    isin_exists_in_mapping,
     get_isins_without_mappings,
+    has_trades_data,
+    isin_exists_in_mapping,
+    load_trades_with_tickers,
+    reset_database,
+    save_isin_ticker_mapping,
+    save_trades,
     validate_all_isins_have_mappings,
 )
-from .security_parser import extract_security_and_isin
+from .merge_csv import merge_csv_files
 from .portfolio import calculate_portfolio_values
-from .background_processor import (
-    precompute_portfolio_data,
-    get_precomputed_portfolio_data,
-    export_precomputed_data,
-    create_precomputed_tables,
-)
-from .portfolio_stats import calculate_time_weighted_return
+from .rebalance import calculate_rebalancing
+from .security_parser import extract_security_and_isin
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
@@ -55,7 +54,6 @@ security = HTTPBasic()
 
 # Default credentials - override via environment variables
 # Example: export AUTH_USERNAME="admin" && export AUTH_PASSWORD="secret123"
-import os
 
 AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
 AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "password")
@@ -74,6 +72,14 @@ async def upload_page(
 ):
     """Render the upload form page."""
     return templates.TemplateResponse("upload.html", {"request": request})
+
+
+@app.get("/mappings/", response_class=HTMLResponse)
+async def mappings_page(
+    request: Request, auth: HTTPBasicCredentials = Depends(verify_credentials)
+):
+    """Render the mappings management page."""
+    return templates.TemplateResponse("mappings.html", {"request": request})
 
 
 @app.post("/reset/")
@@ -371,6 +377,8 @@ async def create_mapping(
     results = []
 
     for mapping in mappings:
+        isin = None
+        ticker = None
         try:
             isin = mapping.get("isin")
             ticker = mapping.get("ticker")
@@ -410,7 +418,7 @@ async def create_mapping(
             results.append(
                 {
                     "success": False,
-                    "isin": isin if "isin" in locals() else None,
+                    "isin": isin,
                     "error": str(e),
                 }
             )
@@ -435,6 +443,62 @@ async def get_mappings(auth: HTTPBasicCredentials = Depends(verify_credentials))
         )
 
 
+@app.get("/mapping/missing/")
+async def get_missing_isins(auth: HTTPBasicCredentials = Depends(verify_credentials)):
+    """
+    Get ISINs from trades that don't have ticker mappings.
+    """
+    try:
+        missing_isins = get_isins_without_mappings()
+        return JSONResponse(
+            content={
+                "success": True,
+                "missing_isins": missing_isins,
+                "count": len(missing_isins),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error retrieving missing ISINs: {e}")
+        return JSONResponse(
+            content={"success": False, "error": str(e)}, status_code=500
+        )
+
+
+@app.delete("/mapping/{isin}/")
+async def delete_mapping(
+    isin: str, auth: HTTPBasicCredentials = Depends(verify_credentials)
+):
+    """
+    Delete an ISIN to ticker mapping.
+    """
+    try:
+        from .database import get_connection
+
+        conn = get_connection()
+        cursor = conn.execute("DELETE FROM isin_to_ticker WHERE isin = ?", (isin,))
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        logger.info(
+            f"Deleted mapping for ISIN: {isin}"
+            if deleted
+            else f"No mapping found for ISIN: {isin}"
+        )
+        return JSONResponse(
+            content={
+                "success": True,
+                "message": f"Mapping for {isin} deleted"
+                if deleted
+                else f"No mapping found for {isin}",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error deleting mapping: {e}")
+        return JSONResponse(
+            content={"success": False, "error": str(e)}, status_code=500
+        )
+
+
 @app.get("/export/prices/")
 async def export_ticker_prices(
     background_tasks: BackgroundTasks,
@@ -450,7 +514,7 @@ async def export_ticker_prices(
         # Try to get precomputed data first
         data = export_precomputed_data()
 
-        if "error" in data:
+        if isinstance(data, dict) and "error" in data:
             return JSONResponse(
                 content={"success": False, "error": data["error"]}, status_code=500
             )
@@ -479,9 +543,15 @@ async def export_ticker_prices(
                             "data_extended": True,
                             "extension_in_progress": True,
                             "last_data_date": max_data_date.strftime("%Y-%m-%d"),
-                            "ticker_prices": data.get("ticker_prices", []),
-                            "count": data.get("count", {}).get("ticker_prices", 0),
-                            "status": data.get("status", {}),
+                            "ticker_prices": data.get("ticker_prices", [])
+                            if isinstance(data, dict)
+                            else [],
+                            "count": data.get("count", {}).get("ticker_prices", 0)
+                            if isinstance(data, dict)
+                            else 0,
+                            "status": data.get("status", {})
+                            if isinstance(data, dict)
+                            else {},
                         }
                     )
         finally:
@@ -492,9 +562,13 @@ async def export_ticker_prices(
             content={
                 "success": True,
                 "data_extended": False,
-                "ticker_prices": data.get("ticker_prices", []),
-                "count": data.get("count", {}).get("ticker_prices", 0),
-                "status": data.get("status", {}),
+                "ticker_prices": data.get("ticker_prices", [])
+                if isinstance(data, dict)
+                else [],
+                "count": data.get("count", {}).get("ticker_prices", 0)
+                if isinstance(data, dict)
+                else 0,
+                "status": data.get("status", {}) if isinstance(data, dict) else {},
             }
         )
 
@@ -503,6 +577,136 @@ async def export_ticker_prices(
         import traceback
 
         traceback.print_exc()
+        return JSONResponse(
+            content={"success": False, "error": str(e)}, status_code=500
+        )
+
+
+@app.get("/rebalance/", response_class=HTMLResponse)
+async def rebalance_page(
+    request: Request, auth: HTTPBasicCredentials = Depends(verify_credentials)
+):
+    """Render the rebalance page."""
+    return templates.TemplateResponse("rebalance.html", {"request": request})
+
+
+@app.get("/rebalance/data/")
+async def get_rebalance_data(auth: HTTPBasicCredentials = Depends(verify_credentials)):
+    """
+    Get current portfolio state for rebalancing.
+    Returns tickers with current values and allocations for invested tickers only.
+    """
+    try:
+        # Validate mappings
+        is_valid, missing_isins = validate_all_isins_have_mappings()
+        if not is_valid:
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "error": "Cannot get portfolio data: missing ticker mappings",
+                    "missing_isins": missing_isins,
+                },
+                status_code=500,
+            )
+
+        # Try precomputed first
+        portfolio_data = get_precomputed_portfolio_data()
+        if portfolio_data and "daily_ticker_values" in portfolio_data:
+            daily_ticker_values = portfolio_data["daily_ticker_values"]
+            last_values = {}
+            for ticker, values in daily_ticker_values.items():
+                if values:
+                    last_values[ticker] = values[-1]
+                else:
+                    last_values[ticker] = 0.0
+        else:
+            # Fallback to live calculation
+            df = load_trades_with_tickers()
+            if df.empty:
+                return JSONResponse(
+                    content={"success": False, "error": "No trades data available"},
+                    status_code=404,
+                )
+            calc_result = calculate_portfolio_values(df)
+            if not calc_result or "daily_ticker_values" not in calc_result:
+                return JSONResponse(
+                    content={
+                        "success": False,
+                        "error": "Failed to calculate portfolio values",
+                    },
+                    status_code=500,
+                )
+            daily_ticker_values = calc_result["daily_ticker_values"]
+            last_values = {
+                t: v[-1] if v else 0.0 for t, v in daily_ticker_values.items()
+            }
+
+        # Filter to invested tickers (value > 0, rounded to 2 decimals)
+        invested = {t: val for t, val in last_values.items() if round(val, 2) > 0}
+        total_value = sum(invested.values())
+
+        tickers = []
+        if total_value > 0:
+            for ticker, value in invested.items():
+                pct = (value / total_value) * 100
+                tickers.append(
+                    {
+                        "ticker": ticker,
+                        "current_value": round(value, 2),
+                        "current_allocation_pct": round(pct, 2),
+                    }
+                )
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "tickers": tickers,
+                "total_value": round(total_value, 2),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error getting rebalance data: {e}")
+        return JSONResponse(
+            content={"success": False, "error": str(e)}, status_code=500
+        )
+
+
+@app.post("/rebalance/calculate/")
+async def calculate_rebalance(
+    body: dict = Body(...), auth: HTTPBasicCredentials = Depends(verify_credentials)
+):
+    """
+    Calculate rebalancing investments.
+    Body: {"new_capital": float, "target_allocations": {ticker: pct}, "current_tickers": [...]}
+    """
+    try:
+        new_capital = body.get("new_capital", 0.0)
+        target_allocations = body.get("target_allocations", {})
+        current_tickers = body.get("current_tickers", [])
+        current_values = {
+            item["ticker"]: item["current_value"] for item in current_tickers
+        }
+
+        if new_capital < 0:
+            raise ValueError("New capital must be non-negative")
+
+        if not target_allocations:
+            raise ValueError("Target allocations are required")
+
+        # Sum of targets for validation (with tolerance)
+        total_target = sum(target_allocations.values())
+        if abs(total_target - 100) > 0.1:  # 0.1% tolerance
+            logger.warning(f"Target allocations sum to {total_target}, normalizing")
+
+        result = calculate_rebalancing(new_capital, current_values, target_allocations)
+
+        return JSONResponse(content={"success": True, **result})
+    except ValueError as e:
+        return JSONResponse(
+            content={"success": False, "error": str(e)}, status_code=400
+        )
+    except Exception as e:
+        logger.error(f"Error calculating rebalance: {e}")
         return JSONResponse(
             content={"success": False, "error": str(e)}, status_code=500
         )

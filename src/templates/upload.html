@@ -79,6 +79,12 @@
 <body>
     <h1>Upload Batch of Trading CSV Files</h1>
     <p>Select multiple CSV files (e.g., GIA and ISA trading statements) to merge into a single file.</p>
+
+    <button class="browse-button" hx-post="/reset/" hx-swap="none"
+        hx-on::after-request="handleResetResponse(event)">Reset Database</button><br><br>
+    <a href="/mappings/" class="browse-button">Manage Mappings</a><br><br>
+    <a href="/rebalance/" class="browse-button">Rebalance Portfolio</a><br><br>
+
     <form hx-post="/upload/" hx-swap="none" hx-on::after-request="handleUploadResponse(event)"
         enctype="multipart/form-data">
         <label>Choose CSV files:</label><br>
@@ -121,11 +127,52 @@
                     htmx.process(target);
                     document.getElementById('charts-container').style.display = 'none';
                 } else {
-                    target.innerHTML = `<div class="error"><h2>Error: ${response.error}</h2><p><a href="/">Try again</a></p></div>`;
+                    let errorHtml = `<div class="error"><h2>Error: ${response.error}</h2>`;
+                    if (response.missing_isins && response.missing_isins.length > 0) {
+                        errorHtml += `<p>Missing ticker mappings for ISINs:</p><ul>`;
+                        response.missing_isins.forEach(isin => {
+                            errorHtml += `<li>${isin}</li>`;
+                        });
+                        errorHtml += `</ul><p><a href="/mappings/" class="browse-button">Go to Manage Mappings to add these</a></p>`;
+                    }
+                    errorHtml += `<p><a href="/">Try again</a></p></div>`;
+                    target.innerHTML = errorHtml;
                 }
             } catch (e) {
                 console.error('Error handling upload response:', e);
                 target.innerHTML = '<div class="error"><h2>Unexpected error occurred</h2><p><a href="/">Try again</a></p></div>';
+            }
+        }
+
+        function handleResetResponse(event) {
+            const target = document.getElementById('result');
+            const xhr = event.detail.xhr;
+            const responseText = xhr.responseText;
+
+            try {
+                console.log('Reset response received');
+                const trimmedText = responseText.trim();
+                const response = JSON.parse(trimmedText);
+
+                if (response.success) {
+                    target.innerHTML = `
+                        <div class="success">
+                            <h2>Database Reset Successful!</h2>
+                            <p>${response.message}</p>
+                            <br>
+                            <button class="browse-button" onclick="resetForm()">Upload New Files</button>
+                        </div>
+                    `;
+                    // Clear any existing charts or form state
+                    document.getElementById('charts-container').style.display = 'none';
+                    document.getElementById('charts-container').innerHTML = '<div id="hist-chart"></div><div id="line-chart"></div>';
+                    document.getElementById('files').value = '';
+                } else {
+                    target.innerHTML = `<div class="error"><h2>Reset Failed</h2><p>Error: ${response.error}</p><p><a href="/">Try again</a></p></div>`;
+                }
+            } catch (e) {
+                console.error('Error handling reset response:', e);
+                target.innerHTML = '<div class="error"><h2>Unexpected error during reset</h2><p><a href="/">Try again</a></p></div>';
             }
         }
 

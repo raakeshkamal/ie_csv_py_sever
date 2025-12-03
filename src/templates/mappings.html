@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manage ISIN Ticker Mappings</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin-bottom: 20px;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            padding: 5px 10px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 5px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        .edit-btn { display: inline; }
+        .save-btn, .cancel-btn { display: none; }
+        .editing {
+            background-color: yellow;
+        }
+        input {
+            margin: 5px;
+            padding: 5px;
+        }
+        form {
+            margin-bottom: 20px;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .browse-button {
+            background: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            display: inline-block;
+            font-size: 14px;
+            text-decoration: none;
+        }
+        .browse-button:hover {
+            background: #0056b3;
+        }
+        ul {
+            list-style-type: none;
+            padding: 0;
+        }
+        li {
+            margin-bottom: 10px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        h1, h2 {
+            color: #333;
+        }
+    </style>
+</head>
+<body>
+    <h1>Manage ISIN to Ticker Mappings</h1>
+    <p>Configure ticker symbols for your investment ISINs to enable portfolio calculations.</p>
+    
+    <div id="navigation">
+        <a href="/" class="browse-button">Back to Upload</a><br><br>
+        <a href="/rebalance/" class="browse-button">Rebalance Portfolio</a><br><br>
+    </div>
+    
+    <div id="existing-mappings-section">
+        <h2>Existing Mappings</h2>
+        <div id="mappings-table">Loading mappings...</div>
+    </div>
+    
+    <div id="missing-isins-section" style="display: none;">
+        <h2>Missing Mappings (from uploaded trades)</h2>
+        <p>These ISINs from your trades need ticker mappings:</p>
+        <div id="missing-list">Loading...</div>
+    </div>
+    
+    <div id="add-mapping-section">
+        <h2>Add New Mapping</h2>
+        <input type="text" id="new-isin" placeholder="ISIN (e.g., IE00B3XXRP09)" pattern="[A-Z]{2}[A-Z0-9]{9}[0-9]" title="ISIN format: 12 characters starting with 2 letters followed by 9 alphanumeric and 1 digit" required style="width: 200px;"><br><br>
+        <input type="text" id="new-ticker" placeholder="Ticker (e.g., VUSA.L)" required style="width: 200px;"><br><br>
+        <button onclick="addNewMapping()" class="browse-button">Add Mapping</button>
+    </div>
+    
+    <div id="result"></div>
+    
+    <script>
+        window.onload = function() {
+            loadMappings();
+            loadMissingISINs();
+        };
+        
+        function loadMappings() {
+            fetch('/mapping/')
+                .then(response => response.json())
+                .then(data => {
+                    const tableDiv = document.getElementById('mappings-table');
+                    if (data.success) {
+                        let html = '<table><thead><tr><th>ISIN</th><th>Ticker</th><th>Security Name</th><th>Actions</th></tr></thead><tbody>';
+                        data.mappings.forEach(mapping => {
+                            const securityName = mapping.security_name || '';
+                            html += `
+                                <tr>
+                                    <td>${mapping.isin}</td>
+                                    <td id="ticker-${mapping.isin}" contenteditable="false">${mapping.ticker}</td>
+                                    <td>${securityName}</td>
+                                    <td>
+                                        <button class="edit-btn" onclick="startEdit('${mapping.isin}')">Edit</button>
+                                        <button class="save-btn" onclick="saveEdit('${mapping.isin}')" style="display:none;">Save</button>
+                                        <button class="cancel-btn" onclick="cancelEdit('${mapping.isin}')" style="display:none;">Cancel</button>
+                                        <button onclick="deleteMapping('${mapping.isin}')">Delete</button>
+                                    </td>
+                                </tr>
+                            `;
+                        });
+                        html += '</tbody></table>';
+                        tableDiv.innerHTML = html;
+                    } else {
+                        tableDiv.innerHTML = '<p>Error loading mappings: ' + data.error + '</p>';
+                    }
+                })
+                .catch(error => {
+                    document.getElementById('mappings-table').innerHTML = '<p>Error loading mappings.</p>';
+                    console.error('Error:', error);
+                });
+        }
+        
+        function loadMissingISINs() {
+            fetch('/mapping/missing/')
+                .then(response => response.json())
+                .then(data => {
+                    const section = document.getElementById('missing-isins-section');
+                    const listDiv = document.getElementById('missing-list');
+                    if (data.success && data.count > 0) {
+                        let html = '<ul>';
+                        data.missing_isins.forEach(isin => {
+                            html += `
+                                <li>
+                                    <strong>${isin}</strong><br>
+                                    Ticker: <input type="text" id="ticker-for-${isin}" placeholder="e.g., VUSA.L" style="width: 150px;">
+                                    <button onclick="quickAdd('${isin}')">Add Mapping</button>
+                                </li>
+                            `;
+                        });
+                        html += '</ul>';
+                        listDiv.innerHTML = html;
+                        section.style.display = 'block';
+                    } else {
+                        section.style.display = 'none';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error loading missing ISINs:', error);
+                    document.getElementById('missing-isins-section').style.display = 'none';
+                });
+        }
+        
+        function startEdit(isin) {
+            const cell = document.getElementById(`ticker-${isin}`);
+            cell.contentEditable = true;
+            cell.classList.add('editing');
+            const row = cell.closest('tr');
+            row.querySelector('.edit-btn').style.display = 'none';
+            row.querySelector('.save-btn').style.display = 'inline';
+            row.querySelector('.cancel-btn').style.display = 'inline';
+            cell.focus();
+        }
+        
+        function saveEdit(isin) {
+            const cell = document.getElementById(`ticker-${isin}`);
+            const newTicker = cell.innerText.trim();
+            if (!newTicker) {
+                alert('Ticker cannot be empty');
+                return;
+            }
+            fetch('/mapping/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify([{ isin: isin, ticker: newTicker }])
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data[0] && data[0].success) {
+                    document.getElementById('result').innerHTML = '<div class="success">Mapping updated successfully</div>';
+                    loadMappings();
+                    loadMissingISINs();
+                } else {
+                    alert('Error updating mapping: ' + (data[0] ? data[0].error : 'Unknown error'));
+                    cancelEdit(isin);
+                }
+            })
+            .catch(error => {
+                alert('Error updating mapping');
+                console.error('Error:', error);
+                cancelEdit(isin);
+            });
+        }
+        
+        function cancelEdit(isin) {
+            loadMappings();
+        }
+        
+        function deleteMapping(isin) {
+            if (confirm(`Delete mapping for ${isin}? This cannot be undone.`)) {
+                fetch(`/mapping/${isin}/`, { method: 'DELETE' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        document.getElementById('result').innerHTML = '<div class="success">' + data.message + '</div>';
+                        loadMappings();
+                        loadMissingISINs();
+                    } else {
+                        alert('Error deleting mapping: ' + data.error);
+                    }
+                })
+                .catch(error => {
+                    alert('Error deleting mapping');
+                    console.error('Error:', error);
+                });
+            }
+        }
+        
+        function addNewMapping() {
+            const isin = document.getElementById('new-isin').value.trim();
+            const ticker = document.getElementById('new-ticker').value.trim();
+            if (!isin || !ticker) {
+                alert('Please fill in both ISIN and Ticker fields');
+                return;
+            }
+            const isinRegex = /^[A-Z]{2}[A-Z0-9]{9}[0-9]$/;
+            if (!isinRegex.test(isin)) {
+                alert('Invalid ISIN format. Must be 12 characters: 2 letters + 9 alphanumeric + 1 digit.');
+                return;
+            }
+            fetch('/mapping/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify([{ isin: isin, ticker: ticker }])
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data[0] && data[0].success) {
+                    document.getElementById('result').innerHTML = '<div class="success">New mapping added successfully</div>';
+                    document.getElementById('new-isin').value = '';
+                    document.getElementById('new-ticker').value = '';
+                    loadMappings();
+                    loadMissingISINs();
+                } else {
+                    alert('Error adding mapping: ' + (data[0] ? data[0].error : 'Unknown error'));
+                }
+            })
+            .catch(error => {
+                alert('Error adding mapping');
+                console.error('Error:', error);
+            });
+        }
+        
+        function quickAdd(isin) {
+            const tickerInput = document.getElementById(`ticker-for-${isin}`);
+            const ticker = tickerInput.value.trim();
+            if (!ticker) {
+                alert('Please enter a ticker for ' + isin);
+                return;
+            }
+            fetch('/mapping/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify([{ isin: isin, ticker: ticker }])
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data[0] && data[0].success) {
+                    document.getElementById('result').innerHTML = '<div class="success">Mapping for ' + isin + ' added successfully</div>';
+                    tickerInput.value = '';
+                    loadMissingISINs();
+                    loadMappings();
+                } else {
+                    alert('Error adding mapping for ' + isin + ': ' + (data[0] ? data[0].error : 'Unknown error'));
+                }
+            })
+            .catch(error => {
+                alert('Error adding mapping');
+                console.error('Error:', error);
+            });
+        }
+    </script>
+</body>
+</html>
