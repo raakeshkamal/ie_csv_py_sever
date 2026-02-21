@@ -3,10 +3,14 @@ Database operations module for InvestEngine CSV Server.
 Provides database connection management and CRUD operations.
 """
 
+import logging
 import sqlite3
-from typing import Optional, List, Dict, Any
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = "db/merged_trading.db"
 
@@ -40,6 +44,7 @@ def reset_database(db_path: Optional[str] = None):
         conn.execute("DROP TABLE IF EXISTS precomputed_monthly_contributions")
         conn.execute("DROP TABLE IF EXISTS precomputed_ticker_prices")
         conn.execute("DROP TABLE IF EXISTS precompute_status")
+        conn.execute("DROP TABLE IF EXISTS cash_flows")
         conn.commit()
     finally:
         conn.close()
@@ -51,7 +56,7 @@ def table_exists(table_name: str, db_path: Optional[str] = None) -> bool:
     try:
         cursor = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-            (table_name,)
+            (table_name,),
         )
         return cursor.fetchone() is not None
     finally:
@@ -88,7 +93,9 @@ def create_prices_table(db_path: Optional[str] = None):
         conn.close()
 
 
-def save_trades(df, conn: Optional[sqlite3.Connection] = None, db_path: Optional[str] = None):
+def save_trades(
+    df, conn: Optional[sqlite3.Connection] = None, db_path: Optional[str] = None
+):
     """Save trades DataFrame to database."""
     close_conn = False
     if conn is None:
@@ -112,11 +119,15 @@ def save_ticker_column(df):
         conn.close()
 
 
-def load_trades(conn: Optional[sqlite3.Connection] = None, db_path: Optional[str] = None):
+def load_trades(
+    conn: Optional[sqlite3.Connection] = None, db_path: Optional[str] = None
+):
     """Load trades from database as DataFrame."""
-    import pandas as pd
     import sqlite3
+
+    import pandas as pd
     from pandas.errors import DatabaseError
+
     close_conn = False
     if conn is None:
         conn = get_connection(db_path)
@@ -140,12 +151,18 @@ def export_trades_as_list(db_path: Optional[str] = None) -> List[Dict[str, Any]]
     df = load_trades_with_tickers(db_path=db_path)
     # Convert datetime columns to strings for JSON serialization
     for col in df.columns:
-        if df[col].dtype.kind == 'M':  # datetime
-            df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
-    return df.to_dict('records')
+        if df[col].dtype.kind == "M":  # datetime
+            df[col] = df[col].dt.strftime("%Y-%m-%d %H:%M:%S")
+    return df.to_dict("records")
 
 
-def cache_price(ticker: str, dates, prices, conn: Optional[sqlite3.Connection] = None, db_path: Optional[str] = None):
+def cache_price(
+    ticker: str,
+    dates,
+    prices,
+    conn: Optional[sqlite3.Connection] = None,
+    db_path: Optional[str] = None,
+):
     """Cache price points for a ticker. Accepts either single values or lists/arrays."""
     import pandas as pd
 
@@ -159,7 +176,7 @@ def cache_price(ticker: str, dates, prices, conn: Optional[sqlite3.Connection] =
             date_str = str(dates)[:10] if not isinstance(dates, str) else dates
             conn.execute(
                 "INSERT OR REPLACE INTO prices (ticker, date, close) VALUES (?, ?, ?)",
-                (ticker, date_str, float(prices))
+                (ticker, date_str, float(prices)),
             )
         # Handle lists/arrays
         else:
@@ -168,10 +185,14 @@ def cache_price(ticker: str, dates, prices, conn: Optional[sqlite3.Connection] =
             for i in range(len(price_series)):
                 price_val = price_series.iloc[i]
                 if pd.notna(price_val) and price_val > 0:
-                    date_str = dates[i].strftime("%Y-%m-%d") if hasattr(dates[i], 'strftime') else str(dates[i])[:10]
+                    date_str = (
+                        dates[i].strftime("%Y-%m-%d")
+                        if hasattr(dates[i], "strftime")
+                        else str(dates[i])[:10]
+                    )
                     conn.execute(
                         "INSERT OR REPLACE INTO prices (ticker, date, close) VALUES (?, ?, ?)",
-                        (ticker, date_str, float(price_val))
+                        (ticker, date_str, float(price_val)),
                     )
     finally:
         if close_conn:
@@ -179,9 +200,12 @@ def cache_price(ticker: str, dates, prices, conn: Optional[sqlite3.Connection] =
             conn.close()
 
 
-def get_cached_prices(ticker: str, start_date: str, end_date: str, db_path: Optional[str] = None) -> Optional[dict]:
+def get_cached_prices(
+    ticker: str, start_date: str, end_date: str, db_path: Optional[str] = None
+) -> Optional[dict]:
     """Get cached prices for a ticker between dates."""
     import pandas as pd
+
     conn = get_connection(db_path)
     try:
         cached_query = f"""
@@ -199,7 +223,9 @@ def get_cached_prices(ticker: str, start_date: str, end_date: str, db_path: Opti
         conn.close()
 
 
-def get_cached_fx_rates(fx_ticker: str, start_date: str, end_date: str, db_path: Optional[str] = None) -> Optional[dict]:
+def get_cached_fx_rates(
+    fx_ticker: str, start_date: str, end_date: str, db_path: Optional[str] = None
+) -> Optional[dict]:
     """Get cached FX rates."""
     return get_cached_prices(fx_ticker, start_date, end_date, db_path)
 
@@ -222,41 +248,56 @@ def create_isin_ticker_mapping_table(db_path: Optional[str] = None):
         conn.close()
 
 
-def save_isin_ticker_mapping(isin: str, ticker: str, security_name: Optional[str], db_path: Optional[str] = None):
+def save_isin_ticker_mapping(
+    isin: str, ticker: str, security_name: Optional[str], db_path: Optional[str] = None
+):
     """Save or update ISIN to ticker mapping."""
     conn = get_connection(db_path)
     try:
         # Check if ISIN already exists
-        cursor = conn.execute("SELECT COUNT(*) FROM isin_to_ticker WHERE isin = ?", (isin,))
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM isin_to_ticker WHERE isin = ?", (isin,)
+        )
         exists = cursor.fetchone()[0] > 0
 
         if exists:
             # Update existing
-            conn.execute("""
+            conn.execute(
+                """
                 UPDATE isin_to_ticker
                 SET ticker = ?, security_name = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE isin = ?
-            """, (ticker, security_name, isin))
+            """,
+                (ticker, security_name, isin),
+            )
         else:
             # Insert new
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO isin_to_ticker (isin, ticker, security_name)
                 VALUES (?, ?, ?)
-            """, (isin, ticker, security_name))
+            """,
+                (isin, ticker, security_name),
+            )
         conn.commit()
     finally:
         conn.close()
 
 
-def get_isin_ticker_mapping(isin: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def get_isin_ticker_mapping(
+    isin: str, db_path: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """Get ticker mapping for a specific ISIN."""
     conn = get_connection(db_path)
     try:
-        cursor = conn.execute("""
+        cursor = conn.execute(
+            """
             SELECT isin, ticker, security_name, created_at, updated_at
             FROM isin_to_ticker
             WHERE isin = ?
-        """, (isin,))
+        """,
+            (isin,),
+        )
         row = cursor.fetchone()
         if row:
             return {
@@ -264,7 +305,7 @@ def get_isin_ticker_mapping(isin: str, db_path: Optional[str] = None) -> Optiona
                 "ticker": row[1],
                 "security_name": row[2],
                 "created_at": row[3],
-                "updated_at": row[4]
+                "updated_at": row[4],
             }
         return None
     finally:
@@ -282,13 +323,15 @@ def get_all_isin_ticker_mappings(db_path: Optional[str] = None) -> List[Dict[str
         """)
         mappings = []
         for row in cursor.fetchall():
-            mappings.append({
-                "isin": row[0],
-                "ticker": row[1],
-                "security_name": row[2],
-                "created_at": row[3],
-                "updated_at": row[4]
-            })
+            mappings.append(
+                {
+                    "isin": row[0],
+                    "ticker": row[1],
+                    "security_name": row[2],
+                    "created_at": row[3],
+                    "updated_at": row[4],
+                }
+            )
         return mappings
     finally:
         conn.close()
@@ -298,7 +341,9 @@ def isin_exists_in_mapping(isin: str, db_path: Optional[str] = None) -> bool:
     """Check if an ISIN exists in the mapping table."""
     conn = get_connection(db_path)
     try:
-        cursor = conn.execute("SELECT COUNT(*) FROM isin_to_ticker WHERE isin = ?", (isin,))
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM isin_to_ticker WHERE isin = ?", (isin,)
+        )
         return cursor.fetchone()[0] > 0
     finally:
         conn.close()
@@ -335,10 +380,13 @@ def get_isins_without_mappings(db_path: Optional[str] = None) -> List[str]:
         conn.close()
 
 
-def load_trades_with_tickers(conn: Optional[sqlite3.Connection] = None, db_path: Optional[str] = None) -> pd.DataFrame:
+def load_trades_with_tickers(
+    conn: Optional[sqlite3.Connection] = None, db_path: Optional[str] = None
+) -> pd.DataFrame:
     """Load trades with ticker information via JOIN with mapping table."""
-    import pandas as pd
     import sqlite3
+
+    import pandas as pd
 
     close_conn = False
     if conn is None:
@@ -364,7 +412,9 @@ def load_trades_with_tickers(conn: Optional[sqlite3.Connection] = None, db_path:
             conn.close()
 
 
-def validate_all_isins_have_mappings(db_path: Optional[str] = None) -> tuple[bool, list[str]]:
+def validate_all_isins_have_mappings(
+    db_path: Optional[str] = None,
+) -> tuple[bool, list[str]]:
     """
     Check if all ISINs in trades have ticker mappings.
     Returns (is_valid, missing_isins)
@@ -372,3 +422,109 @@ def validate_all_isins_have_mappings(db_path: Optional[str] = None) -> tuple[boo
     missing = get_isins_without_mappings(db_path)
     return len(missing) == 0, missing
 
+
+def create_cash_flows_table(db_path: Optional[str] = None):
+    """Create the cash_flows table if it doesn't exist."""
+    conn = get_connection(db_path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cash_flows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date DATE NOT NULL,
+                activity TEXT NOT NULL,
+                credit REAL,
+                debit REAL,
+                balance REAL,
+                account_type TEXT,
+                net_flow REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cash_flows_date ON cash_flows(date)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_cash_flows(
+    df, conn: Optional[sqlite3.Connection] = None, db_path: Optional[str] = None
+):
+    """Save cash flows DataFrame to database."""
+    close_conn = False
+    if conn is None:
+        conn = get_connection(db_path)
+        close_conn = True
+    try:
+        df.to_sql("cash_flows", conn, if_exists="replace", index=False)
+        conn.commit()
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def load_cash_flows(
+    conn: Optional[sqlite3.Connection] = None, db_path: Optional[str] = None
+) -> pd.DataFrame:
+    """Load cash flows from database as DataFrame."""
+    import sqlite3
+
+    from pandas.errors import DatabaseError
+
+    close_conn = False
+    if conn is None:
+        conn = get_connection(db_path)
+        close_conn = True
+    try:
+        try:
+            df = pd.read_sql_query("SELECT * FROM cash_flows", conn)
+            return df
+        except (sqlite3.OperationalError, DatabaseError) as e:
+            if "no such table: cash_flows" in str(e):
+                return pd.DataFrame()
+            raise
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def get_external_cash_flow_events(
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Get external cash flow events for TWR calculation.
+    Returns list of dicts with 'date' and 'net_amount' for cash flows.
+    """
+    conn = get_connection(db_path)
+    try:
+        query = """
+            SELECT date, net_flow, activity
+            FROM cash_flows
+            ORDER BY date
+        """
+        df = pd.read_sql_query(query, conn)
+        df.columns = df.columns.str.lower()
+
+        events = []
+        for _, row in df.iterrows():
+            net = row["net_flow"]
+            if abs(net) > 1e-6:
+                date_val = row["date"]
+                if isinstance(date_val, str):
+                    date_str = date_val
+                else:
+                    date_str = pd.to_datetime(date_val).strftime("%Y-%m-%d")
+                events.append(
+                    {
+                        "date": date_str,
+                        "net_amount": float(net),
+                        "activity": row["activity"],
+                    }
+                )
+        return events
+    except Exception as e:
+        logger.error(f"Error extracting cash flow events: {e}", exc_info=True)
+        return []
+    finally:
+        conn.close()

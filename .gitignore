@@ -23,6 +23,6 @@ ENV/
 *.db
 db/
 
-trading_statements/
+statements/
 Caddyfile
 

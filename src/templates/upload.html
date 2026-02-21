@@ -1,118 +1,146 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Upload Trading CSV Files</title>
+        <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 600px;
+                margin: 50px auto;
+                padding: 20px;
+            }
 
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Upload Trading CSV Files</title>
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 600px;
-            margin: 50px auto;
-            padding: 20px;
-        }
+            form {
+                border: 1px solid #ddd;
+                padding: 20px;
+                border-radius: 8px;
+            }
 
-        form {
-            border: 1px solid #ddd;
-            padding: 20px;
-            border-radius: 8px;
-        }
+            input[type="file"] {
+                margin-bottom: 10px;
+            }
 
-        input[type="file"] {
-            margin-bottom: 10px;
-        }
+            input[type="submit"] {
+                background: #007bff;
+                color: white;
+                padding: 10px 20px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+            }
 
-        input[type="submit"] {
-            background: #007bff;
-            color: white;
-            padding: 10px 20px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-        }
+            input[type="submit"]:hover {
+                background: #0056b3;
+            }
 
-        input[type="submit"]:hover {
-            background: #0056b3;
-        }
+            h1 {
+                color: #333;
+            }
 
-        h1 {
-            color: #333;
-        }
+            #result {
+                margin-top: 20px;
+                padding: 10px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+            }
 
-        #result {
-            margin-top: 20px;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-        }
+            .success {
+                background-color: #d4edda;
+                color: #155724;
+            }
 
-        .success {
-            background-color: #d4edda;
-            color: #155724;
-        }
+            .error {
+                background-color: #f8d7da;
+                color: #721c24;
+            }
 
-        .error {
-            background-color: #f8d7da;
-            color: #721c24;
-        }
+            .browse-button {
+                background: #007bff;
+                color: white;
+                padding: 10px 20px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                display: inline-block;
+                font-size: 14px;
+            }
 
-        .browse-button {
-            background: #007bff;
-            color: white;
-            padding: 10px 20px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            display: inline-block;
-            font-size: 14px;
-        }
+            .browse-button:hover {
+                background: #0056b3;
+            }
+        </style>
+    </head>
 
-        .browse-button:hover {
-            background: #0056b3;
-        }
-    </style>
-</head>
+    <body>
+        <h1>Upload Batch of Trading CSV Files</h1>
+        <p>
+            Select multiple CSV files (e.g., GIA and ISA trading statements) to
+            merge into a single file.
+        </p>
 
-<body>
-    <h1>Upload Batch of Trading CSV Files</h1>
-    <p>Select multiple CSV files (e.g., GIA and ISA trading statements) to merge into a single file.</p>
+        <button
+            class="browse-button"
+            hx-post="/reset/"
+            hx-swap="none"
+            hx-on::after-request="handleResetResponse(event)"
+        >
+            Reset Database</button
+        ><br /><br />
+        <a href="/mappings/" class="browse-button">Manage Mappings</a
+        ><br /><br />
+        <a href="/rebalance/" class="browse-button">Rebalance Portfolio</a
+        ><br /><br />
 
-    <button class="browse-button" hx-post="/reset/" hx-swap="none"
-        hx-on::after-request="handleResetResponse(event)">Reset Database</button><br><br>
-    <a href="/mappings/" class="browse-button">Manage Mappings</a><br><br>
-    <a href="/rebalance/" class="browse-button">Rebalance Portfolio</a><br><br>
+        <form
+            hx-post="/upload/"
+            hx-swap="none"
+            hx-on::after-request="handleUploadResponse(event)"
+            enctype="multipart/form-data"
+        >
+            <label>Choose CSV files:</label><br />
+            <input
+                type="file"
+                id="files"
+                name="files"
+                multiple
+                accept=".csv"
+                required
+                style="display: none"
+                onchange="if(this.files.length > 0) { console.log('Files selected, submitting form'); htmx.trigger(this.form, 'submit'); }"
+            /><br />
+            <label for="files" class="browse-button">Browse Files</label><br />
+        </form>
+        <div id="result"></div>
+        <div id="charts-container" style="display: none">
+            <div id="hist-chart"></div>
+            <div id="line-chart"></div>
+        </div>
+        <script>
+            function handleUploadResponse(event) {
+                const target = document.getElementById("result");
+                const xhr = event.detail.xhr;
+                const responseText = xhr.responseText;
 
-    <form hx-post="/upload/" hx-swap="none" hx-on::after-request="handleUploadResponse(event)"
-        enctype="multipart/form-data">
-        <label>Choose CSV files:</label><br>
-        <input type="file" id="files" name="files" multiple accept=".csv" required style="display: none;"
-            onchange="if(this.files.length > 0) { console.log('Files selected, submitting form'); htmx.trigger(this.form, 'submit'); }"><br>
-        <label for="files" class="browse-button">Browse Files</label><br>
-    </form>
-    <div id="result"></div>
-    <div id="charts-container" style="display: none;">
-        <div id="hist-chart"></div>
-        <div id="line-chart"></div>
-    </div>
-    <script>
-        function handleUploadResponse(event) {
-            const target = document.getElementById('result');
-            const xhr = event.detail.xhr;
-            const responseText = xhr.responseText;
+                try {
+                    // Debug logging to help identify JSON parsing issues
+                    console.log(
+                        "Raw response text length:",
+                        responseText.length,
+                    );
+                    console.log(
+                        "First 20 chars:",
+                        JSON.stringify(responseText.substring(0, 20)),
+                    );
 
-            try {
-                // Debug logging to help identify JSON parsing issues
-                console.log('Raw response text length:', responseText.length);
-                console.log('First 20 chars:', JSON.stringify(responseText.substring(0, 20)));
-
-                // Trim whitespace and BOM characters before parsing
-                const trimmedText = responseText.trim();
-                const response = JSON.parse(trimmedText);
-                if (response.success) {
-                    let html = `
+                    // Trim whitespace and BOM characters before parsing
+                    const trimmedText = responseText.trim();
+                    const response = JSON.parse(trimmedText);
+                    if (response.success) {
+                        let html = `
                         <div class="success">
                             <h2>Files merged successfully!</h2>
                             <p>Total transactions: ${response.total_transactions}</p>
@@ -123,39 +151,45 @@
                             <button class="browse-button" onclick="resetForm()">Upload another batch</button>
                         </div>
                     `;
-                    target.innerHTML = html;
-                    htmx.process(target);
-                    document.getElementById('charts-container').style.display = 'none';
-                } else {
-                    let errorHtml = `<div class="error"><h2>Error: ${response.error}</h2>`;
-                    if (response.missing_isins && response.missing_isins.length > 0) {
-                        errorHtml += `<p>Missing ticker mappings for ISINs:</p><ul>`;
-                        response.missing_isins.forEach(isin => {
-                            errorHtml += `<li>${isin}</li>`;
-                        });
-                        errorHtml += `</ul><p><a href="/mappings/" class="browse-button">Go to Manage Mappings to add these</a></p>`;
+                        target.innerHTML = html;
+                        htmx.process(target);
+                        document.getElementById(
+                            "charts-container",
+                        ).style.display = "none";
+                    } else {
+                        let errorHtml = `<div class="error"><h2>Error: ${response.error}</h2>`;
+                        if (
+                            response.missing_isins &&
+                            response.missing_isins.length > 0
+                        ) {
+                            errorHtml += `<p>Missing ticker mappings for ISINs:</p><ul>`;
+                            response.missing_isins.forEach((isin) => {
+                                errorHtml += `<li>${isin}</li>`;
+                            });
+                            errorHtml += `</ul><p><a href="/mappings/" class="browse-button">Go to Manage Mappings to add these</a></p>`;
+                        }
+                        errorHtml += `<p><a href="/">Try again</a></p></div>`;
+                        target.innerHTML = errorHtml;
                     }
-                    errorHtml += `<p><a href="/">Try again</a></p></div>`;
-                    target.innerHTML = errorHtml;
+                } catch (e) {
+                    console.error("Error handling upload response:", e);
+                    target.innerHTML =
+                        '<div class="error"><h2>Unexpected error occurred</h2><p><a href="/">Try again</a></p></div>';
                 }
-            } catch (e) {
-                console.error('Error handling upload response:', e);
-                target.innerHTML = '<div class="error"><h2>Unexpected error occurred</h2><p><a href="/">Try again</a></p></div>';
             }
-        }
 
-        function handleResetResponse(event) {
-            const target = document.getElementById('result');
-            const xhr = event.detail.xhr;
-            const responseText = xhr.responseText;
+            function handleResetResponse(event) {
+                const target = document.getElementById("result");
+                const xhr = event.detail.xhr;
+                const responseText = xhr.responseText;
 
-            try {
-                console.log('Reset response received');
-                const trimmedText = responseText.trim();
-                const response = JSON.parse(trimmedText);
+                try {
+                    console.log("Reset response received");
+                    const trimmedText = responseText.trim();
+                    const response = JSON.parse(trimmedText);
 
-                if (response.success) {
-                    target.innerHTML = `
+                    if (response.success) {
+                        target.innerHTML = `
                         <div class="success">
                             <h2>Database Reset Successful!</h2>
                             <p>${response.message}</p>
@@ -163,80 +197,149 @@
                             <button class="browse-button" onclick="resetForm()">Upload New Files</button>
                         </div>
                     `;
-                    // Clear any existing charts or form state
-                    document.getElementById('charts-container').style.display = 'none';
-                    document.getElementById('charts-container').innerHTML = '<div id="hist-chart"></div><div id="line-chart"></div>';
-                    document.getElementById('files').value = '';
-                } else {
-                    target.innerHTML = `<div class="error"><h2>Reset Failed</h2><p>Error: ${response.error}</p><p><a href="/">Try again</a></p></div>`;
-                }
-            } catch (e) {
-                console.error('Error handling reset response:', e);
-                target.innerHTML = '<div class="error"><h2>Unexpected error during reset</h2><p><a href="/">Try again</a></p></div>';
-            }
-        }
-
-        function handlePortfolioResponse(event) {
-            console.log('Portfolio response received');
-            const target = document.getElementById('charts-container');
-            const xhr = event.detail.xhr;
-            const responseText = xhr.responseText;
-
-            try {
-                const response = JSON.parse(responseText);
-                if (response.success) {
-                    if (response.monthly_net && response.monthly_net.length > 0) {
-                        const months = response.monthly_net.map(m => m.Month);
-                        const net_values = response.monthly_net.map(m => m.Net_Value);
-
-                        // Bar chart for monthly net
-                        Plotly.newPlot('hist-chart', [{
-                            x: months,
-                            y: net_values,
-                            type: 'bar',
-                            name: 'Monthly Net Contributions'
-                        }], {
-                            title: 'Monthly Net Contributions (Buy positive, Sell negative)',
-                            xaxis: { title: 'Month' },
-                            yaxis: { title: 'Net Value' }
-                        });
-
-                        // Line chart for daily portfolio value
-                        if (response.daily_dates && response.daily_values && response.daily_dates.length > 0) {
-                            Plotly.newPlot('line-chart', [{
-                                x: response.daily_dates,
-                                y: response.daily_values,
-                                type: 'line',
-                                name: 'Actual Portfolio Value'
-                            }], {
-                                title: 'Actual Portfolio Value Over Time (Including Price Changes)',
-                                xaxis: { title: 'Date' },
-                                yaxis: { title: 'Portfolio Value' }
-                            });
-                        }
+                        // Clear any existing charts or form state
+                        document.getElementById(
+                            "charts-container",
+                        ).style.display = "none";
+                        document.getElementById("charts-container").innerHTML =
+                            '<div id="hist-chart"></div><div id="line-chart"></div>';
+                        document.getElementById("files").value = "";
                     } else {
-                        target.innerHTML = '<p>Chart data unavailable.</p>';
+                        target.innerHTML = `<div class="error"><h2>Reset Failed</h2><p>Error: ${response.error}</p><p><a href="/">Try again</a></p></div>`;
                     }
-                    target.style.display = 'block';
-                } else {
-                    target.innerHTML = `<div class="error"><h2>Error generating charts: ${response.error}</h2></div>`;
-                    target.style.display = 'block';
+                } catch (e) {
+                    console.error("Error handling reset response:", e);
+                    target.innerHTML =
+                        '<div class="error"><h2>Unexpected error during reset</h2><p><a href="/">Try again</a></p></div>';
                 }
-            } catch (e) {
-                console.error('Error handling portfolio response:', e);
-                target.innerHTML = '<div class="error"><h2>Unexpected error generating charts</h2></div>';
-                target.style.display = 'block';
             }
-            console.log('Charts generation completed');
-        }
 
-        function resetForm() {
-            document.getElementById('files').value = '';
-            document.getElementById('result').innerHTML = '';
-            document.getElementById('charts-container').style.display = 'none';
-            document.getElementById('charts-container').innerHTML = '<div id="hist-chart"></div><div id="line-chart"></div>';
-        }
-    </script>
-</body>
+            function handlePortfolioResponse(event) {
+                console.log("Portfolio response received");
+                const target = document.getElementById("charts-container");
+                const xhr = event.detail.xhr;
+                const responseText = xhr.responseText;
 
+                try {
+                    const response = JSON.parse(responseText);
+                    if (response.success) {
+                        let statsHtml = "";
+                        if (response.portfolio_stats) {
+                            const s = response.portfolio_stats;
+                            const irr = (s.irr * 100).toFixed(2) + "%";
+                            const invested = new Intl.NumberFormat("en-GB", {
+                                style: "currency",
+                                currency: "GBP",
+                            }).format(s.total_invested);
+                            const current = new Intl.NumberFormat("en-GB", {
+                                style: "currency",
+                                currency: "GBP",
+                            }).format(s.current_value);
+                            const pl = new Intl.NumberFormat("en-GB", {
+                                style: "currency",
+                                currency: "GBP",
+                            }).format(s.profit_loss);
+                            const plClass =
+                                s.profit_loss >= 0 ? "success" : "error";
+                            const returnPct =
+                                (s.return_percentage * 100).toFixed(2) + "%";
+
+                            statsHtml = `
+                            <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
+                                <h3>Portfolio Performance</h3>
+                                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px;">
+                                    <div><strong>IRR:</strong> <span style="font-size: 1.2em; color: ${s.irr >= 0 ? "green" : "red"}">${irr}</span></div>
+                                    <div><strong>Current Value:</strong> ${current}</div>
+                                    <div><strong>Net Invested:</strong> ${invested}</div>
+                                    <div><strong>Profit/Loss:</strong> <span class="${plClass}" style="padding: 2px 5px; border-radius: 3px;">${pl} (${returnPct})</span></div>
+                                    <div><strong>As of:</strong> ${s.calc_date}</div>
+                                </div>
+                            </div>
+                        `;
+                        }
+
+                        target.innerHTML =
+                            statsHtml +
+                            '<div id="hist-chart"></div><div id="line-chart"></div>';
+
+                        if (
+                            response.monthly_net &&
+                            response.monthly_net.length > 0
+                        ) {
+                            const months = response.monthly_net.map(
+                                (m) => m.Month,
+                            );
+                            const net_values = response.monthly_net.map(
+                                (m) => m.Net_Value,
+                            );
+
+                            // Bar chart for monthly net
+                            Plotly.newPlot(
+                                "hist-chart",
+                                [
+                                    {
+                                        x: months,
+                                        y: net_values,
+                                        type: "bar",
+                                        name: "Monthly Net Contributions",
+                                    },
+                                ],
+                                {
+                                    title: "Monthly Net Contributions (Buy positive, Sell negative)",
+                                    xaxis: { title: "Month" },
+                                    yaxis: { title: "Net Value" },
+                                },
+                            );
+
+                            // Line chart for daily portfolio value
+                            if (
+                                response.daily_dates &&
+                                response.daily_values &&
+                                response.daily_values.length > 0
+                            ) {
+                                Plotly.newPlot(
+                                    "line-chart",
+                                    [
+                                        {
+                                            x: response.daily_dates,
+                                            y: response.daily_values,
+                                            type: "line",
+                                            name: "Actual Portfolio Value",
+                                        },
+                                    ],
+                                    {
+                                        title: "Actual Portfolio Value Over Time (Including Price Changes)",
+                                        xaxis: { title: "Date" },
+                                        yaxis: { title: "Portfolio Value" },
+                                    },
+                                );
+                            }
+                        } else {
+                            target.innerHTML +=
+                                "<p>Chart data unavailable.</p>";
+                        }
+                        target.style.display = "block";
+                    } else {
+                        target.innerHTML = `<div class="error"><h2>Error generating charts: ${response.error}</h2></div>`;
+                        target.style.display = "block";
+                    }
+                } catch (e) {
+                    console.error("Error handling portfolio response:", e);
+                    target.innerHTML =
+                        '<div class="error"><h2>Unexpected error generating charts</h2></div>';
+                    target.style.display = "block";
+                }
+                console.log("Charts generation completed");
+            }
+
+            function resetForm() {
+                document.getElementById("files").value = "";
+                document.getElementById("result").innerHTML = "";
+                document.getElementById("charts-container").style.display =
+                    "none";
+                document.getElementById("charts-container").innerHTML =
+                    '<div id="hist-chart"></div><div id="line-chart"></div>';
+            }
+        </script>
+    </body>
 </html>

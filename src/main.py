@@ -24,6 +24,7 @@ from .background_processor import (
     precompute_portfolio_data,
 )
 from .database import (
+    create_cash_flows_table,
     create_isin_ticker_mapping_table,
     create_prices_table,
     export_trades_as_list,
@@ -33,11 +34,12 @@ from .database import (
     isin_exists_in_mapping,
     load_trades_with_tickers,
     reset_database,
+    save_cash_flows,
     save_isin_ticker_mapping,
     save_trades,
     validate_all_isins_have_mappings,
 )
-from .merge_csv import merge_csv_files
+from .merge_csv import detect_file_type, merge_cash_files, merge_csv_files
 from .portfolio import calculate_portfolio_values
 from .rebalance import calculate_rebalancing
 from .security_parser import extract_security_and_isin
@@ -94,6 +96,7 @@ async def reset_database_endpoint(
         reset_database()
         create_prices_table()
         create_isin_ticker_mapping_table()
+        create_cash_flows_table()
         create_precomputed_tables()
         logger.info("Database reset successfully")
         return JSONResponse(
@@ -140,6 +143,7 @@ async def upload_files(
 ):
     """
     Handle batch CSV upload, merge them, and save to database (overwrites old data).
+    Accepts both Trading and Cash statement CSVs.
     Requires calling /reset/ first to ensure data consistency.
     """
     logger.info("Endpoint /upload/ called")
@@ -178,67 +182,111 @@ async def upload_files(
             status_code=400,
         )
 
+    # Separate files by type
+    trading_files = [(f, c) for f, c in file_data if detect_file_type(f) == "trading"]
+    cash_files = [(f, c) for f, c in file_data if detect_file_type(f) == "cash"]
+
+    logger.info(
+        f"Processing {len(trading_files)} trading files and {len(cash_files)} cash files"
+    )
+
     try:
-        # Merge CSV files
-        merged_df = merge_csv_files(file_data)
+        merged_trading_df = None
+        merged_cash_df = None
 
-        # Parse Security / ISIN column to extract security_name and isin
-        logger.info("Parsing security names and ISINs...")
-        parsed_data = merged_df["Security / ISIN"].apply(
-            lambda x: pd.Series(
-                extract_security_and_isin(x), index=["security_name", "isin"]
+        # Process trading files
+        if trading_files:
+            logger.info(f"Merging {len(trading_files)} trading files...")
+            merged_trading_df = merge_csv_files(trading_files)
+
+            # Parse Security / ISIN column to extract security_name and isin
+            logger.info("Parsing security names and ISINs...")
+            parsed_data = merged_trading_df["Security / ISIN"].apply(
+                lambda x: pd.Series(
+                    extract_security_and_isin(x), index=["security_name", "isin"]
+                )
             )
-        )
-        merged_df = merged_df.join(parsed_data)
+            merged_trading_df = merged_trading_df.join(parsed_data)
 
-        # Validate that all ISINs have ticker mappings
-        missing_isins = []
-        for isin in merged_df["isin"].dropna().unique():
-            if not isin_exists_in_mapping(isin):
-                missing_isins.append(isin)
+            # Validate that all ISINs have ticker mappings
+            missing_isins = []
+            for isin in merged_trading_df["isin"].dropna().unique():
+                if not isin_exists_in_mapping(isin):
+                    missing_isins.append(isin)
 
-        if missing_isins:
-            logger.error(f"Missing ticker mappings for ISINs: {missing_isins}")
-            return JSONResponse(
-                content={
-                    "success": False,
-                    "error": "Missing ticker mappings for some ISINs",
-                    "missing_isins": missing_isins,
-                },
-                status_code=400,
-            )
+            if missing_isins:
+                logger.error(f"Missing ticker mappings for ISINs: {missing_isins}")
+                return JSONResponse(
+                    content={
+                        "success": False,
+                        "error": "Missing ticker mappings for some ISINs",
+                        "missing_isins": missing_isins,
+                    },
+                    status_code=400,
+                )
 
-        # Save to database (with security_name and isin columns)
-        save_trades(merged_df)
+            # Save trading data to database
+            save_trades(merged_trading_df)
+            logger.info(f"Saved {len(merged_trading_df)} trading transactions")
 
-        # Load back with ticker mappings for background processing
+        # Process cash files
+        if cash_files:
+            logger.info(f"Merging {len(cash_files)} cash files...")
+            merged_cash_df = merge_cash_files(cash_files)
+
+            # Save cash flows to database
+            save_cash_flows(merged_cash_df)
+            logger.info(f"Saved {len(merged_cash_df)} cash flow records")
+
+        # Create cash_flows table if needed
+        create_cash_flows_table()
+
+        # Determine date range
+        min_date = None
+        max_date = None
+
+        if merged_trading_df is not None and not merged_trading_df.empty:
+            min_date = merged_trading_df["Trade Date/Time"].min()
+            max_date = merged_trading_df["Trade Date/Time"].max()
+
+        if merged_cash_df is not None and not merged_cash_df.empty:
+            cash_min = merged_cash_df["Date"].min()
+            cash_max = merged_cash_df["Date"].max()
+            if min_date is None or cash_min < min_date:
+                min_date = cash_min
+            if max_date is None or cash_max > max_date:
+                max_date = cash_max
+
+        # Load trades with tickers for background processing
         df_with_tickers = load_trades_with_tickers()
 
         # Trigger background processing of yfinance data
         logger.info("Starting background yfinance data collection...")
         background_tasks.add_task(precompute_portfolio_data, df_with_tickers)
 
-        logger.info(
-            f"DEBUG: Merged DF shape: {merged_df.shape}, "
-            f"Date range: {merged_df['Trade Date/Time'].min()} to {merged_df['Trade Date/Time'].max()}"
-        )
-        logger.info(
-            f"DEBUG: Sample Transaction Types: {merged_df['Transaction Type'].unique()}"
-        )
+        if merged_trading_df is not None:
+            logger.info(
+                f"DEBUG: Merged Trading DF shape: {merged_trading_df.shape}, "
+                f"Date range: {merged_trading_df['Trade Date/Time'].min()} to {merged_trading_df['Trade Date/Time'].max()}"
+            )
+            logger.info(
+                f"DEBUG: Sample Transaction Types: {merged_trading_df['Transaction Type'].unique()}"
+            )
 
         # Success response
-        min_date = merged_df["Trade Date/Time"].min()
-        max_date = merged_df["Trade Date/Time"].max()
+        trading_count = len(merged_trading_df) if merged_trading_df is not None else 0
+        cash_count = len(merged_cash_df) if merged_cash_df is not None else 0
 
         return JSONResponse(
             content={
                 "success": True,
-                "total_transactions": len(merged_df),
-                "min_date": str(min_date),
-                "max_date": str(max_date),
+                "total_trading_transactions": trading_count,
+                "total_cash_flows": cash_count,
+                "min_date": str(min_date) if min_date is not None else None,
+                "max_date": str(max_date) if max_date is not None else None,
                 "message": (
-                    f"Successfully uploaded {len(merged_df)} transactions. "
-                    f"Date range: {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}"
+                    f"Successfully uploaded {trading_count} trading transactions and {cash_count} cash flows. "
+                    f"Date range: {min_date.strftime('%Y-%m-%d') if min_date else 'N/A'} to {max_date.strftime('%Y-%m-%d') if max_date else 'N/A'}"
                 ),
             }
         )

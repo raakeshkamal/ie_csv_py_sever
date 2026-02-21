@@ -20,7 +20,7 @@ from .portfolio import (
     get_valid_unique_tickers,
     simulate_holdings,
 )
-from .portfolio_stats import calculate_time_weighted_return
+from .portfolio_stats import calculate_portfolio_stats
 from .prices import (
     convert_currency,
     get_common_start_date,
@@ -208,17 +208,16 @@ def create_precomputed_tables(conn=None, db_path: Optional[str] = None):
             )
         """)
 
-        # TWR metrics table (stores calculated TWR metrics for the entire period)
+        # Portfolio metrics table (stores calculated IRR and P&L metrics)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS precomputed_twr_metrics (
+            CREATE TABLE IF NOT EXISTS precomputed_portfolio_metrics (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
-                twr REAL,
-                total_return REAL,
-                annualized_return REAL,
-                sub_periods TEXT,
-                period_start TEXT,
-                period_end TEXT,
-                total_days INTEGER,
+                irr REAL,
+                total_invested REAL,
+                current_value REAL,
+                profit_loss REAL,
+                return_percentage REAL,
+                calc_date TEXT,
                 last_updated TIMESTAMP
             )
         """)
@@ -244,35 +243,13 @@ def create_precomputed_tables(conn=None, db_path: Optional[str] = None):
 
 def extract_cash_flow_events(df: pd.DataFrame) -> List[Dict]:
     """
-    Extract cash flow events by computing daily net flows from buy/sell trades.
-    Net buy (buys - sells) treated as inflow proxy, net sell as outflow.
-    Returns sorted list of {'date': 'YYYY-MM-DD', 'net_amount': float} for significant flows.
+    Extract cash flow events from cash_flows table.
+    Uses external cash flows (Payment Received, Withdrawal, ISA Transfer In).
+    Returns sorted list of {'date': 'YYYY-MM-DD', 'net_amount': float}.
     """
-    if df.empty:
-        return []
+    from .database import get_external_cash_flow_events
 
-    # Ensure datetime
-    df = df.copy()
-    df["trade_date"] = df["Trade Date/Time"].dt.date
-
-    # Group by trade_date and compute net: sum buys - sum sells
-    def compute_net(group):
-        buys = group[group["Transaction Type"] == "Buy"]["Total Trade Value"].sum()
-        sells = group[group["Transaction Type"] == "Sell"]["Total Trade Value"].sum()
-        return buys - sells
-
-    daily_net = (
-        df.groupby("trade_date")
-        .apply(compute_net, include_groups=False)
-        .reset_index(name="net_amount")
-    )
-
-    events = []
-    for _, row in daily_net.iterrows():
-        net = row["net_amount"]
-        if abs(net) > 1.0:  # threshold for significant flow
-            date_str = row["trade_date"].isoformat()
-            events.append({"date": date_str, "net_amount": float(net)})
+    events = get_external_cash_flow_events()
 
     return sorted(events, key=lambda x: x["date"])
 
@@ -330,9 +307,26 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         conn.commit()
 
         # Get date range
-        common_start = get_common_start_date(unique_tickers)
-        max_date = max(df["Trade Date/Time"].max().date(), date.today())
+        trade_min_date = df["Trade Date/Time"].min().date()
 
+        # Get cash flow min date
+        # cash_flow_events was extracted earlier
+        # We need to make sure cash_flow_events is defined here if we use it later
+        cash_flow_events = extract_cash_flow_events(df)
+
+        cash_min_date = None
+        if cash_flow_events:
+            cash_min_date = pd.to_datetime(cash_flow_events[0]["date"]).date()
+
+        # Portfolio start is min of trade or cash activity
+        portfolio_start_date = trade_min_date
+        if cash_min_date and cash_min_date < portfolio_start_date:
+            portfolio_start_date = cash_min_date
+
+        logger.info(f"Portfolio start date determined: {portfolio_start_date}")
+        common_start = portfolio_start_date
+
+        max_date = max(df["Trade Date/Time"].max().date(), date.today())
         if not common_start or common_start > max_date:
             logger.error("No valid date range")
             conn.execute(
@@ -426,34 +420,36 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
                 (item["Month"], float(item["Net_Value"]), datetime.now()),
             )
 
-        # Compute cash flow events for exact TWR sub-periods
-        cash_flow_events = extract_cash_flow_events(df)
+        # Use previously extracted cash flow events
+        # cash_flow_events = extract_cash_flow_events(df)  <-- Already computed above
 
-        # Calculate TWR metrics
-        daily_dates_str = [d.strftime("%Y-%m-%d") for d in dates]
-        twr_result = calculate_time_weighted_return(
-            daily_dates_str,
-            detailed_values["total_value"],
-            monthly_net,
-            cash_flow_events,
+        # Calculate Portfolio stats (IRR, P&L)
+        current_value = (
+            detailed_values["total_value"][-1]
+            if detailed_values["total_value"]
+            else 0.0
+        )
+        current_date = dates[-1] if len(dates) > 0 else date.today()
+
+        stats_result = calculate_portfolio_stats(
+            cash_flow_events, current_value, current_date
         )
 
-        # Store TWR metrics (single row with id=1)
-        conn.execute("DELETE FROM precomputed_twr_metrics")
-        if twr_result:
+        # Store Portfolio metrics (single row with id=1)
+        conn.execute("DELETE FROM precomputed_portfolio_metrics")
+        if stats_result:
             conn.execute(
-                """INSERT INTO precomputed_twr_metrics
-                   (id, twr, total_return, annualized_return, sub_periods, period_start, period_end, total_days, last_updated)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO precomputed_portfolio_metrics
+                   (id, irr, total_invested, current_value, profit_loss, return_percentage, calc_date, last_updated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     1,
-                    twr_result["time_weighted_return"],
-                    twr_result["total_return"],
-                    twr_result["annualized_return"],
-                    json.dumps(twr_result["sub_periods"]),
-                    twr_result["period_start"],
-                    twr_result["period_end"],
-                    twr_result["total_days"],
+                    stats_result["irr"],
+                    stats_result["total_invested"],
+                    stats_result["current_value"],
+                    stats_result["profit_loss"],
+                    stats_result["return_percentage"],
+                    stats_result["calc_date"],
                     datetime.now(),
                 ),
             )
@@ -541,22 +537,23 @@ def get_precomputed_portfolio_data(db_path: Optional[str] = None) -> Optional[Di
                 ticker_data = ticker_df[ticker_df["ticker"] == ticker]
                 daily_ticker_values[ticker] = ticker_data["daily_value"].tolist()
 
-        # Get TWR metrics
-        twr_df = pd.read_sql_query(
-            "SELECT twr, total_return, annualized_return, sub_periods, period_start, period_end, total_days "
-            + "FROM precomputed_twr_metrics ORDER BY last_updated DESC LIMIT 1",
+        # Get Portfolio stats (IRR, P&L)
+        stats_df = pd.read_sql_query(
+            "SELECT irr, total_invested, current_value, profit_loss, return_percentage, calc_date, last_updated "
+            + "FROM precomputed_portfolio_metrics ORDER BY last_updated DESC LIMIT 1",
             conn,
         )
-        twr_metrics = {}
-        if not twr_df.empty:
-            twr_metrics = {
-                "time_weighted_return": float(twr_df.iloc[0]["twr"]),
-                "total_return": float(twr_df.iloc[0]["total_return"]),
-                "annualized_return": float(twr_df.iloc[0]["annualized_return"]),
-                "sub_periods": json.loads(twr_df.iloc[0]["sub_periods"]),
-                "period_start": twr_df.iloc[0]["period_start"],
-                "period_end": twr_df.iloc[0]["period_end"],
-                "total_days": int(twr_df.iloc[0]["total_days"]),
+        portfolio_stats = {}
+        if not stats_df.empty:
+            row = stats_df.iloc[0]
+            portfolio_stats = {
+                "irr": float(row["irr"]),
+                "total_invested": float(row["total_invested"]),
+                "current_value": float(row["current_value"]),
+                "profit_loss": float(row["profit_loss"]),
+                "return_percentage": float(row["return_percentage"]),
+                "calc_date": row["calc_date"],
+                "last_updated": row["last_updated"],
             }
 
         return {
@@ -564,7 +561,7 @@ def get_precomputed_portfolio_data(db_path: Optional[str] = None) -> Optional[Di
             "daily_dates": daily_dates,
             "daily_values": daily_values,
             "daily_ticker_values": daily_ticker_values,
-            "twr_metrics": twr_metrics,
+            "portfolio_stats": portfolio_stats,
         }
 
     except Exception as e:

@@ -1,234 +1,169 @@
 """
 Portfolio statistics module for InvestEngine CSV Server.
-Handles Time-Weighted Return (TWR) calculations.
+Handles Internal Rate of Return (IRR) calculations using exact cash flows.
 """
 
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime, date
 import logging
+from datetime import date, datetime
+from typing import Dict, List, Optional, Union
+
+import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 
-def calculate_time_weighted_return(
-    daily_dates: List[str], 
-    daily_values: List[float], 
-    monthly_contributions: List[Dict],
-    cash_flow_events: Optional[List[Dict]] = None
-) -> Optional[Dict]:
+def calculate_portfolio_stats(
+    cash_flow_events: List[Dict],
+    current_value: float,
+    current_date: Union[str, date, datetime],
+) -> Dict:
     """
-    Calculate Time-Weighted Return (TWR) for the portfolio.
+    Calculate portfolio statistics including IRR and Profit/Loss.
 
     Args:
-        daily_dates: List of dates in 'YYYY-MM-DD' format
-        daily_values: List of daily portfolio values
-        monthly_contributions: List of monthly net contributions (for fallback)
-        cash_flow_events: List of dicts with 'date': str, 'net_amount': float for exact cash flows
+        cash_flow_events: List of dicts with 'date' and 'net_amount' (from DB).
+                          Note: DB 'net_amount' is (Credit - Debit), so:
+                          Positive = Deposit (Inflow to account)
+                          Negative = Withdrawal (Outflow from account)
+        current_value: Total portfolio value at current_date
+        current_date: Date of the current valuation
 
     Returns:
-        Dict containing TWR metrics
+        Dict containing IRR, total invested, and P&L metrics.
     """
-    if not daily_dates or not daily_values or len(daily_dates) != len(daily_values):
-        return None
+    if not cash_flow_events:
+        curr_date_str = (
+            current_date.strftime("%Y-%m-%d")
+            if hasattr(current_date, "strftime")
+            else str(current_date)[:10]
+        )
+        return {
+            "irr": 0.0,
+            "total_invested": 0.0,
+            "current_value": current_value,
+            "profit_loss": 0.0,
+            "return_percentage": 0.0,
+            "calc_date": curr_date_str,
+        }
 
-    # Convert to pandas Series for easier manipulation
-    df = pd.DataFrame({"date": pd.to_datetime(daily_dates), "value": daily_values})
-    df = df.set_index("date").sort_index()
-    df.index = pd.DatetimeIndex(df.index)
+    # valid cash flows
+    # DB Net Amount: +ve = Deposit, -ve = Withdrawal
+    # IRR Perspective: Deposit = Negative (Investment), Withdrawal = Positive (Return)
+    # So we negate the DB net_amount for IRR calculation.
 
-    # Get cashflow dates from cash_flow_events or fallback to monthly
-    cashflow_dates = _get_cashflow_dates(monthly_contributions, df.index, cash_flow_events)
+    dates = []
+    amounts = []
+    total_invested = 0.0
+    total_withdrawn = 0.0
 
-    # Calculate sub-period returns
-    sub_periods = _calculate_sub_period_returns(df, cashflow_dates)
+    # 1. Process historical cash flows
+    for event in cash_flow_events:
+        try:
+            d = pd.to_datetime(event["date"]).date()
+            net_amount = float(event["net_amount"])
 
-    # Calculate overall TWR
-    twr = _chain_link_returns(sub_periods)
+            # For stats:
+            if net_amount > 0:
+                total_invested += net_amount
+            else:
+                total_withdrawn += abs(net_amount)
 
-    # Calculate additional metrics
-    total_return = _calculate_total_return(df)
-    start_date = df.index[0].date()
-    end_date = df.index[-1].date()
-    annualized_return = _annualize_return(twr, start_date, end_date)
+            # For IRR: Negate (Deposit becomes negative cashflow)
+            dates.append(d)
+            amounts.append(-net_amount)
 
-    total_days = (end_date - start_date).days + 1 if start_date != end_date else 1
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Skipping invalid cash flow event: {event} - {e}")
+
+    # 2. Add current value as final positive cash flow (liquidation value)
+    curr_date_obj = pd.to_datetime(current_date).date()
+    dates.append(curr_date_obj)
+    amounts.append(current_value)
+
+    # 3. Calculate metrics
+    irr = xirr(dates, amounts)
+
+    # Simple P&L = Current Value + Withdrawals - Deposits
+    profit_loss = current_value + total_withdrawn - total_invested
+
+    # Simple Return % (Money Weighted roughly)
+    # If total_invested is 0, handle gracefully
+    if total_invested > 0:
+        return_percentage = profit_loss / total_invested
+    else:
+        return_percentage = 0.0
 
     return {
-        "time_weighted_return": twr,
-        "total_return": total_return,
-        "annualized_return": annualized_return,
-        "sub_periods": sub_periods,
-        "period_start": df.index[0].strftime("%Y-%m-%d"),
-        "period_end": df.index[-1].strftime("%Y-%m-%d"),
-        "total_days": total_days,
+        "irr": irr,
+        "total_invested": total_invested,
+        "total_withdrawn": total_withdrawn,
+        "current_value": current_value,
+        "profit_loss": profit_loss,
+        "return_percentage": return_percentage,
+        "calc_date": curr_date_obj.strftime("%Y-%m-%d"),
     }
 
 
-def _get_cashflow_dates(
-    monthly_contributions: List[Dict], 
-    date_index: pd.Index,
-    cash_flow_events: Optional[List[Dict]] = None
-) -> List[pd.Timestamp]:
+def xirr(dates, amounts, guess=0.1) -> float:
     """
-    Identify dates when cashflows occurred using exact events if provided, else monthly.
-    Returns list of timestamps for sub-period ends (just before each cashflow).
+    Calculate the Internal Rate of Return (XIRR) for irregular intervals.
+    Uses Newton-Raphson method.
     """
-    if cash_flow_events:
-        cashflow_dates = []
-        for cf in cash_flow_events:
-            if abs(cf.get('net_amount', 0)) > 1e-6:
-                try:
-                    ts = pd.Timestamp(cf['date'])
-                    if date_index[0] < ts <= date_index[-1]:  # within range
-                        cashflow_dates.append(ts)
-                except ValueError:
-                    logger.warning(f"Invalid date in cash flow: {cf['date']}")
-        return sorted(set(cashflow_dates))  # unique, sorted
-    else:
-        # Fallback to monthly
-        if not monthly_contributions:
-            return []
-        cashflow_dates = []
-        for contribution in monthly_contributions:
-            month_str = contribution["Month"]  # 'YYYY-MM' format
-            net_value = contribution["Net_Value"]
-            if abs(net_value) > 1e-6:
-                month_start = pd.Timestamp(month_str + "-01")
-                if month_start > date_index[0]:
-                    cashflow_date = month_start - pd.Timedelta(days=1)
-                    cashflow_dates.append(cashflow_date)
-        return sorted(cashflow_dates)
-
-
-def _calculate_sub_period_returns(
-    df: pd.DataFrame, 
-    cashflow_dates: List[pd.Timestamp]
-) -> List[Dict]:
-    """
-    Calculate returns for each sub-period between cashflows.
-    Uses the last available date strictly before the cashflow date as the sub-period end.
-    """
-    sub_periods = []
-
-    if not cashflow_dates:
-        # No cashflows, single period
-        start_value = df["value"].iloc[0]
-        end_value = df["value"].iloc[-1]
-
-        if start_value > 0:
-            period_return = (end_value / start_value) - 1
-        else:
-            period_return = 0.0
-
-        sub_periods.append(
-            {
-                "start_date": df.index[0].strftime("%Y-%m-%d"),
-                "end_date": df.index[-1].strftime("%Y-%m-%d"),
-                "start_value": float(start_value),
-                "end_value": float(end_value),
-                "return": float(period_return),
-            }
-        )
-        return sub_periods
-
-    # Multiple periods with cashflows
-    period_start_idx = 0
-
-    for cashflow_date in cashflow_dates:
-        # Find the largest index where df.index < cashflow_date
-        pre_mask = df.index < cashflow_date
-        if not pre_mask.any():
-            continue
-        period_end_idx = np.where(pre_mask)[0][-1]
-
-        if period_end_idx <= period_start_idx:
-            continue
-
-        # Calculate return for this sub-period
-        start_value = df["value"].iloc[period_start_idx]
-        end_value = df["value"].iloc[period_end_idx]
-
-        if start_value > 0:
-            period_return = (end_value / start_value) - 1
-        else:
-            period_return = 0.0
-
-        sub_periods.append(
-            {
-                "start_date": df.index[period_start_idx].strftime("%Y-%m-%d"),
-                "end_date": df.index[period_end_idx].strftime("%Y-%m-%d"),
-                "start_value": float(start_value),
-                "end_value": float(end_value),
-                "return": float(period_return),
-            }
-        )
-
-        # Next period starts on or after cashflow_date
-        post_mask = df.index >= cashflow_date
-        if post_mask.any():
-            next_start_idx = np.where(post_mask)[0][0]
-        else:
-            next_start_idx = len(df)
-        period_start_idx = max(next_start_idx, period_end_idx + 1)
-
-    # Last period (from last cashflow to end)
-    if period_start_idx < len(df):
-        start_value = df["value"].iloc[period_start_idx]
-        end_value = df["value"].iloc[-1]
-
-        if start_value > 0:
-            period_return = (end_value / start_value) - 1
-        else:
-            period_return = 0.0
-
-        sub_periods.append(
-            {
-                "start_date": df.index[period_start_idx].strftime("%Y-%m-%d"),
-                "end_date": df.index[-1].strftime("%Y-%m-%d"),
-                "start_value": float(start_value),
-                "end_value": float(end_value),
-                "return": float(period_return),
-            }
-        )
-
-    return sub_periods
-
-
-def _chain_link_returns(sub_periods: List[Dict]) -> float:
-    """
-    Chain-link sub-period returns to get overall TWR.
-    TWR = (1 + r1) * (1 + r2) * ... * (1 + rn) - 1
-    """
-    if not sub_periods:
+    if len(dates) != len(amounts) or len(dates) < 2:
         return 0.0
 
-    chained = 1.0
-    for period in sub_periods:
-        chained *= 1 + period["return"]
+    # Sort by date
+    data = sorted(zip(dates, amounts), key=lambda x: x[0])
+    dates, amounts = zip(*data)
 
-    return float(chained - 1)
+    start_date = dates[0]
+    # Calculate fraction of years for each cash flow
+    years = np.array([(d - start_date).days / 365.0 for d in dates])
+    amounts = np.array(amounts)
 
-
-def _calculate_total_return(df: pd.DataFrame) -> float:
-    """
-    Calculate total return over the entire period.
-    """
-    start_value = df["value"].iloc[0]
-    end_value = df["value"].iloc[-1]
-
-    if start_value > 0:
-        return float((end_value / start_value) - 1)
-    return 0.0
-
-
-def _annualize_return(return_rate: float, start_date: date, end_date: date) -> float:
-    """
-    Annualize the return rate using (1 + r)^(365 / days) - 1.
-    """
-    days = (end_date - start_date).days + 1
-    if days <= 0:
+    # Check validity: must have at least one positive and one negative value
+    if np.all(amounts >= 0) or np.all(amounts <= 0):
         return 0.0
-    exponent = 365.25 / days
-    return float((1 + return_rate) ** exponent - 1)
+
+    # Newton-Raphson
+    rate = guess
+    max_iter = 100
+    tol = 1e-6
+
+    for _ in range(max_iter):
+        # f(r) = sum( C_i / (1+r)^t_i )
+        # To avoid complex numbers with negative base, we iterate on (1+r) or ensure base > 0
+        # Usually XIRR is > -100%, so 1+r > 0.
+
+        if rate <= -1.0:
+            rate = -0.99  # clamp to avoid division by zero or complex
+
+        # Calculate NPV and derivative
+        # factor = (1+rate)^(-t)
+        base = 1.0 + rate
+        try:
+            factors = np.power(base, -years)
+            f_val = np.sum(amounts * factors)
+
+            # f'(r) = sum( C_i * -t_i * (1+r)^(-t_i - 1) )
+            #       = sum( C_i * -t_i * factor / (1+r) )
+            df_val = np.sum(amounts * -years * factors) / base
+
+        except (OverflowError, FloatingPointError, ZeroDivisionError):
+            return 0.0
+
+        if abs(f_val) < tol:
+            return rate
+
+        if abs(df_val) < 1e-9:  # Derivative too small
+            break
+
+        new_rate = rate - f_val / df_val
+
+        if abs(new_rate - rate) < tol:
+            return new_rate
+
+        rate = new_rate
+
+    return rate if not pd.isna(rate) else 0.0

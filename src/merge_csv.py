@@ -1,8 +1,23 @@
 import io
+import re
 from datetime import datetime
 from typing import List, Tuple
 
 import pandas as pd
+
+
+def detect_file_type(filename: str) -> str:
+    """
+    Detect if file is 'trading' or 'cash' statement based on filename.
+    Returns "trading" or "cash".
+    """
+    filename_upper = filename.upper()
+    if "_CASH_" in filename_upper:
+        return "cash"
+    elif "_TRADING_" in filename_upper:
+        return "trading"
+    else:
+        return "trading"
 
 
 def extract_account_type(filename: str) -> str:
@@ -127,6 +142,132 @@ def merge_csv_files(file_data: List[Tuple[str, str]]) -> pd.DataFrame:
 
     # Reorder columns to put Account_Type after headers
     cols = expected_columns + ["Account_Type"]
+    merged_df = merged_df[cols]
+
+    return merged_df
+
+
+def parse_cash_date(date_str: str) -> datetime:
+    """
+    Parse date string from cash statement format (DD/MM/YY).
+    """
+    if pd.isna(date_str):
+        return pd.NaT
+
+    date_str = str(date_str).strip()
+    result = pd.to_datetime(date_str, format="%d/%m/%y", errors="coerce")
+    return result
+
+
+def extract_cash_flows_only(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filter cash DataFrame to only external cash flow activities.
+    Includes: Payment Received, Withdrawal, ISA Transfer In
+    Excludes: Opening Balance, Purchase, Sale, Transfer, Dividend
+    """
+    cash_flow_activities = [
+        "Payment Received",
+        "Withdrawal",
+        "ISA Transfer In",
+    ]
+
+    return df[df["Activity"].isin(cash_flow_activities)].copy()
+
+
+def merge_cash_files(file_data: List[Tuple[str, str]]) -> pd.DataFrame:
+    """
+    Merge cash statement CSVs into a single DataFrame.
+
+    Handles:
+    - Multi-portfolio files (skip "Portfolio: Cash", only use "Portfolio: None")
+    - Multiple header rows within one file
+    - Adds Account_Type column (GIA/ISA)
+    - Filters to external cash flows only
+
+    Returns: DataFrame with Date, Activity, Credit, Debit, Balance, Account_Type, Net_Flow
+    """
+    dfs = []
+
+    for filename, content_str in file_data:
+        content_str = content_str.lstrip("\ufeff")
+        lines = content_str.split("\n")
+
+        current_df_lines = []
+        current_account_type = extract_account_type(filename)
+        headers = None
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith("Cash Statement:"):
+                portfolio_match = re.search(r"Portfolio:\s*(\w+)", line)
+                if portfolio_match:
+                    portfolio_type = portfolio_match.group(1)
+                    if portfolio_type == "Cash":
+                        current_df_lines = []
+                        headers = None
+                        continue
+
+                if current_df_lines and headers:
+                    try:
+                        csv_content = "\n".join([",".join(headers)] + current_df_lines)
+                        temp_df = pd.read_csv(io.StringIO(csv_content))
+                        temp_df["Account_Type"] = current_account_type
+                        dfs.append(temp_df)
+                    except Exception:
+                        pass
+
+                current_df_lines = []
+                headers = None
+                continue
+
+            if headers is None:
+                if line.startswith("Date,Activity"):
+                    headers = ["Date", "Activity", "Credit", "Debit", "Balance"]
+                    continue
+            else:
+                current_df_lines.append(line)
+
+        if current_df_lines and headers:
+            try:
+                csv_content = "\n".join([",".join(headers)] + current_df_lines)
+                temp_df = pd.read_csv(io.StringIO(csv_content))
+                temp_df["Account_Type"] = current_account_type
+                dfs.append(temp_df)
+            except Exception:
+                pass
+
+    if not dfs:
+        raise ValueError("No valid cash CSV data to merge")
+
+    merged_df = pd.concat(dfs, ignore_index=True)
+
+    merged_df["Credit"] = pd.to_numeric(merged_df["Credit"].fillna(0), errors="coerce")
+    merged_df["Debit"] = pd.to_numeric(merged_df["Debit"].fillna(0), errors="coerce")
+    merged_df["Balance"] = pd.to_numeric(
+        merged_df["Balance"].fillna(0), errors="coerce"
+    )
+
+    merged_df["Date"] = merged_df["Date"].apply(parse_cash_date)
+    merged_df = merged_df.dropna(subset=["Date"])
+
+    merged_df["Net_Flow"] = merged_df["Credit"] - merged_df["Debit"]
+
+    merged_df = extract_cash_flows_only(merged_df)
+
+    merged_df = merged_df.sort_values("Date").reset_index(drop=True)
+
+    cols = [
+        "Date",
+        "Activity",
+        "Credit",
+        "Debit",
+        "Balance",
+        "Account_Type",
+        "Net_Flow",
+    ]
     merged_df = merged_df[cols]
 
     return merged_df
