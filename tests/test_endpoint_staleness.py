@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 
 from src.main import app
 
+
 @pytest.fixture
 def temp_db_path():
     """Create a temporary SQLite DB and yield its path."""
@@ -14,6 +15,7 @@ def temp_db_path():
         path = tmp.name
     yield path
     # Cleanup is handled by the OS when the file is closed
+
 
 def setup_isin_mapping_table(conn):
     """Create ISIN to ticker mapping table and add test mapping."""
@@ -30,6 +32,7 @@ def setup_isin_mapping_table(conn):
         ("TEST_ISIN", "VUSA.L", "Test Security"),
     )
     conn.commit()
+
 
 def setup_precomputed_portfolio(conn, max_date_str):
     """Create tables and insert a single precomputed portfolio value with given max date."""
@@ -70,6 +73,19 @@ def setup_precomputed_portfolio(conn, max_date_str):
             last_error TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS precomputed_portfolio_metrics (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            irr REAL,
+            twr REAL,
+            total_invested REAL,
+            current_value REAL,
+            profit_loss REAL,
+            return_percentage REAL,
+            calc_date TEXT,
+            last_updated TIMESTAMP
+        )
+    """)
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # Insert a single row with the provided max date
     conn.execute(
@@ -86,18 +102,30 @@ def setup_precomputed_portfolio(conn, max_date_str):
         "INSERT INTO precompute_status (status, started_at, completed_at, total_tickers) VALUES (?, ?, ?, ?)",
         ("completed", now, now, 1),
     )
+    # Insert dummy portfolio metrics
+    conn.execute(
+        """INSERT INTO precomputed_portfolio_metrics
+           (id, irr, twr, total_invested, current_value, profit_loss, return_percentage, calc_date, last_updated)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (1, 0.1, 0.1, 1000.0, 1100.0, 100.0, 0.1, max_date_str, now),
+    )
     conn.commit()
+
 
 def test_portfolio_values_stale_data_triggers_extension(temp_db_path):
     """When precomputed data is older than today, the endpoint should trigger background extension."""
     # Set up DB with a date of yesterday
-    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime(
+        "%Y-%m-%d"
+    )
     conn = sqlite3.connect(temp_db_path)
     setup_precomputed_portfolio(conn, yesterday)
     conn.close()
 
     # Patch DB_PATH in src.database to use our temporary DB
-    with patch.object(__import__("src.database", fromlist=["DB_PATH"]), "DB_PATH", temp_db_path):
+    with patch.object(
+        __import__("src.database", fromlist=["DB_PATH"]), "DB_PATH", temp_db_path
+    ):
         # Mock precompute_portfolio_data to avoid real background work
         with patch("src.main.precompute_portfolio_data") as mock_precompute:
             client = TestClient(app)
@@ -112,6 +140,7 @@ def test_portfolio_values_stale_data_triggers_extension(temp_db_path):
             # Verify that the mock was called (background task scheduled)
             mock_precompute.assert_called()
 
+
 def test_portfolio_values_current_data_no_extension(temp_db_path):
     """When precomputed data is up to today, no extension should be triggered."""
     today_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -119,7 +148,9 @@ def test_portfolio_values_current_data_no_extension(temp_db_path):
     setup_precomputed_portfolio(conn, today_str)
     conn.close()
 
-    with patch.object(__import__("src.database", fromlist=["DB_PATH"]), "DB_PATH", temp_db_path):
+    with patch.object(
+        __import__("src.database", fromlist=["DB_PATH"]), "DB_PATH", temp_db_path
+    ):
         with patch("src.main.precompute_portfolio_data") as mock_precompute:
             client = TestClient(app)
             response = client.get("/portfolio-values/")
@@ -129,10 +160,13 @@ def test_portfolio_values_current_data_no_extension(temp_db_path):
             assert data.get("data_extended") is False
             mock_precompute.assert_not_called()
 
+
 def test_export_prices_stale_data_triggers_extension(temp_db_path):
     """Stale precomputed ticker prices should cause extension flag in export endpoint."""
     # Insert stale ticker price data (yesterday)
-    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime(
+        "%Y-%m-%d"
+    )
     conn = sqlite3.connect(temp_db_path)
     # Create tables
     conn.execute("""
@@ -169,7 +203,9 @@ def test_export_prices_stale_data_triggers_extension(temp_db_path):
     conn.commit()
     conn.close()
 
-    with patch.object(__import__("src.database", fromlist=["DB_PATH"]), "DB_PATH", temp_db_path):
+    with patch.object(
+        __import__("src.database", fromlist=["DB_PATH"]), "DB_PATH", temp_db_path
+    ):
         with patch("src.main.precompute_portfolio_data") as mock_precompute:
             client = TestClient(app)
             response = client.get("/export/prices/")
@@ -178,6 +214,7 @@ def test_export_prices_stale_data_triggers_extension(temp_db_path):
             assert data.get("extension_in_progress") is True
             assert data.get("data_extended") is True
             mock_precompute.assert_called()
+
 
 def test_export_prices_current_data_no_extension(temp_db_path):
     """When price data is up to today, export endpoint should not trigger extension."""
@@ -216,7 +253,9 @@ def test_export_prices_current_data_no_extension(temp_db_path):
     conn.commit()
     conn.close()
 
-    with patch.object(__import__("src.database", fromlist=["DB_PATH"]), "DB_PATH", temp_db_path):
+    with patch.object(
+        __import__("src.database", fromlist=["DB_PATH"]), "DB_PATH", temp_db_path
+    ):
         with patch("src.main.precompute_portfolio_data") as mock_precompute:
             client = TestClient(app)
             response = client.get("/export/prices/")

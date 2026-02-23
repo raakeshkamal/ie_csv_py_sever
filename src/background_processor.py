@@ -6,6 +6,7 @@ Handles asynchronous collection of ticker prices, FX rates, and portfolio values
 import concurrent.futures
 import json
 import logging
+import sqlite3
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -208,11 +209,12 @@ def create_precomputed_tables(conn=None, db_path: Optional[str] = None):
             )
         """)
 
-        # Portfolio metrics table (stores calculated IRR and P&L metrics)
+        # Portfolio metrics table (stores calculated IRR, TWR, and P&L metrics)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS precomputed_portfolio_metrics (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 irr REAL,
+                twr REAL,
                 total_invested REAL,
                 current_value REAL,
                 profit_loss REAL,
@@ -233,6 +235,13 @@ def create_precomputed_tables(conn=None, db_path: Optional[str] = None):
                 last_error TEXT
             )
         """)
+
+        try:
+            conn.execute(
+                "ALTER TABLE precomputed_portfolio_metrics ADD COLUMN twr REAL"
+            )
+        except sqlite3.OperationalError:
+            pass
 
         conn.commit()
         logger.info("Precomputed tables created successfully")
@@ -423,7 +432,7 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         # Use previously extracted cash flow events
         # cash_flow_events = extract_cash_flow_events(df)  <-- Already computed above
 
-        # Calculate Portfolio stats (IRR, P&L)
+        # Calculate Portfolio stats (IRR, TWR, P&L)
         current_value = (
             detailed_values["total_value"][-1]
             if detailed_values["total_value"]
@@ -431,8 +440,15 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         )
         current_date = dates[-1] if len(dates) > 0 else date.today()
 
+        daily_dates = [d.strftime("%Y-%m-%d") for d in dates]
         stats_result = calculate_portfolio_stats(
-            cash_flow_events, current_value, current_date
+            cash_flow_events,
+            current_value,
+            current_date,
+            daily_portfolio_values={
+                "daily_dates": daily_dates,
+                "daily_values": detailed_values["total_value"],
+            },
         )
 
         # Store Portfolio metrics (single row with id=1)
@@ -440,11 +456,12 @@ def precompute_portfolio_data(df, conn=None, db_path: Optional[str] = None) -> b
         if stats_result:
             conn.execute(
                 """INSERT INTO precomputed_portfolio_metrics
-                   (id, irr, total_invested, current_value, profit_loss, return_percentage, calc_date, last_updated)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (id, irr, twr, total_invested, current_value, profit_loss, return_percentage, calc_date, last_updated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     1,
                     stats_result["irr"],
+                    stats_result["twr"],
                     stats_result["total_invested"],
                     stats_result["current_value"],
                     stats_result["profit_loss"],
@@ -537,9 +554,9 @@ def get_precomputed_portfolio_data(db_path: Optional[str] = None) -> Optional[Di
                 ticker_data = ticker_df[ticker_df["ticker"] == ticker]
                 daily_ticker_values[ticker] = ticker_data["daily_value"].tolist()
 
-        # Get Portfolio stats (IRR, P&L)
+        # Get Portfolio stats (IRR, TWR, P&L)
         stats_df = pd.read_sql_query(
-            "SELECT irr, total_invested, current_value, profit_loss, return_percentage, calc_date, last_updated "
+            "SELECT irr, twr, total_invested, current_value, profit_loss, return_percentage, calc_date, last_updated "
             + "FROM precomputed_portfolio_metrics ORDER BY last_updated DESC LIMIT 1",
             conn,
         )
@@ -547,7 +564,8 @@ def get_precomputed_portfolio_data(db_path: Optional[str] = None) -> Optional[Di
         if not stats_df.empty:
             row = stats_df.iloc[0]
             portfolio_stats = {
-                "irr": float(row["irr"]),
+                "irr": float(row["irr"]) if pd.notna(row["irr"]) else 0.0,
+                "twr": float(row["twr"]) if pd.notna(row["twr"]) else 0.0,
                 "total_invested": float(row["total_invested"]),
                 "current_value": float(row["current_value"]),
                 "profit_loss": float(row["profit_loss"]),

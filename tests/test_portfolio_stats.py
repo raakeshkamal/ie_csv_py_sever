@@ -1,12 +1,12 @@
 """
-Tests for portfolio statistics (IRR, etc.)
+Tests for portfolio statistics (IRR, TWR, etc.)
 """
 
 from datetime import date, datetime
 
 import pytest
 
-from src.portfolio_stats import calculate_portfolio_stats, xirr
+from src.portfolio_stats import calculate_portfolio_stats, calculate_twr, xirr
 
 
 def test_xirr_simple():
@@ -83,3 +83,54 @@ def test_calculate_portfolio_stats_with_withdrawal():
     # NPV(r) = -1000 + 500/(1+r)^0.5 + 600/(1+r)^1 = 0
     # Let's just check it's positive and consistent
     assert stats["irr"] > 0.10
+
+
+def test_calculate_twr_basic():
+    daily_dates = ["2023-01-01", "2023-07-01", "2024-01-01"]
+    daily_values = [1000.0, 1050.0, 1100.0]
+    cash_flows = [{"date": "2023-01-01", "net_amount": 1000.0}]
+    current_date = date(2024, 1, 1)
+
+    twr = calculate_twr(daily_dates, daily_values, cash_flows, current_date)
+
+    assert 0.08 < twr < 0.12
+
+
+def test_calculate_twr_with_cash_flow():
+    daily_dates = ["2023-01-01", "2023-07-01", "2024-01-01"]
+    daily_values = [1000.0, 1550.0, 1650.0]
+    cash_flows = [
+        {"date": "2023-01-01", "net_amount": 1000.0},
+        {"date": "2023-07-01", "net_amount": 500.0},
+    ]
+    current_date = date(2024, 1, 1)
+
+    twr = calculate_twr(daily_dates, daily_values, cash_flows, current_date)
+
+    assert twr > 0.05
+
+
+def test_calculate_portfolio_stats_with_twr():
+    daily_dates = ["2023-01-01", "2024-01-01"]
+    daily_values = [1000.0, 1100.0]
+    cash_flows = [{"date": "2023-01-01", "net_amount": 1000.0}]
+    current_value = 1100.0
+    current_date = date(2024, 1, 1)
+
+    stats = calculate_portfolio_stats(
+        cash_flows,
+        current_value,
+        current_date,
+        daily_portfolio_values={
+            "daily_dates": daily_dates,
+            "daily_values": daily_values,
+        },
+    )
+
+    assert "twr" in stats
+    assert 0.08 < stats["twr"] < 0.12
+
+
+def test_calculate_twr_empty():
+    assert calculate_twr([], [], [], date(2023, 1, 1)) == 0.0
+    assert calculate_twr(["2023-01-01"], [1000.0], [], date(2023, 1, 1)) == 0.0

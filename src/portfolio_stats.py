@@ -13,13 +13,101 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def calculate_twr(
+    daily_dates: List[str],
+    daily_values: List[float],
+    cash_flow_events: List[Dict],
+    current_date: Union[str, date, datetime],
+) -> float:
+    """
+    Calculate Time-Weighted Return (TWR), annualized.
+
+    TWR breaks the return into sub-periods at each cash flow, eliminating
+    the impact of cash flows on the return calculation.
+
+    Args:
+        daily_dates: List of date strings (YYYY-MM-DD)
+        daily_values: List of portfolio values corresponding to daily_dates
+        cash_flow_events: List of dicts with 'date' and 'net_amount'
+        current_date: The final valuation date
+
+    Returns:
+        Annualized TWR as a decimal (e.g., 0.10 = 10%)
+    """
+    if not daily_dates or not daily_values or len(daily_dates) != len(daily_values):
+        return 0.0
+
+    date_to_value = {str(d)[:10]: v for d, v in zip(daily_dates, daily_values)}
+    sorted_dates = sorted(date_to_value.keys())
+
+    if len(sorted_dates) < 2:
+        return 0.0
+
+    start_date = sorted_dates[0]
+    end_date = (
+        str(current_date)[:10]
+        if hasattr(current_date, "strftime")
+        else str(current_date)[:10]
+    )
+
+    cash_flows_by_date = {}
+    for event in cash_flow_events:
+        try:
+            d = str(pd.to_datetime(event["date"]).date())
+            net_amount = float(event["net_amount"])
+            cash_flows_by_date[d] = cash_flows_by_date.get(d, 0.0) + net_amount
+        except (ValueError, TypeError):
+            continue
+
+    period_dates = set(cash_flows_by_date.keys())
+    period_dates.add(start_date)
+    period_dates.add(end_date)
+    period_dates = sorted([d for d in period_dates if d in date_to_value])
+
+    if len(period_dates) < 2:
+        return 0.0
+
+    twr = 1.0
+    for i in range(len(period_dates) - 1):
+        period_start = period_dates[i]
+        period_end = period_dates[i + 1]
+
+        start_val = date_to_value.get(period_start, 0.0)
+        end_val = date_to_value.get(period_end, 0.0)
+
+        if start_val <= 0:
+            continue
+
+        cash_flow_at_end = cash_flows_by_date.get(period_end, 0.0)
+
+        end_val_before_cf = end_val - cash_flow_at_end
+        period_return = end_val_before_cf / start_val - 1.0
+        twr *= 1.0 + period_return
+
+    twr -= 1.0
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    days = (end_dt - start_dt).days
+
+    if days <= 0:
+        return 0.0
+
+    if (1.0 + twr) <= 0:
+        return 0.0
+
+    annualized_twr = (1.0 + twr) ** (365.25 / days) - 1.0
+    return float(annualized_twr)
+
+
 def calculate_portfolio_stats(
     cash_flow_events: List[Dict],
     current_value: float,
     current_date: Union[str, date, datetime],
+    daily_portfolio_values: Optional[Dict] = None,
 ) -> Dict:
     """
-    Calculate portfolio statistics including IRR and Profit/Loss.
+    Calculate portfolio statistics including IRR, TWR, and Profit/Loss.
 
     Args:
         cash_flow_events: List of dicts with 'date' and 'net_amount' (from DB).
@@ -28,18 +116,22 @@ def calculate_portfolio_stats(
                           Negative = Withdrawal (Outflow from account)
         current_value: Total portfolio value at current_date
         current_date: Date of the current valuation
+        daily_portfolio_values: Optional dict with 'daily_dates' and 'daily_values'
+                                for TWR calculation
 
     Returns:
-        Dict containing IRR, total invested, and P&L metrics.
+        Dict containing IRR, TWR, total invested, and P&L metrics.
     """
     if not cash_flow_events:
-        curr_date_str = (
-            current_date.strftime("%Y-%m-%d")
-            if hasattr(current_date, "strftime")
-            else str(current_date)[:10]
-        )
+        if isinstance(current_date, str):
+            curr_date_str = current_date[:10]
+        elif isinstance(current_date, datetime):
+            curr_date_str = current_date.strftime("%Y-%m-%d")
+        else:
+            curr_date_str = current_date.strftime("%Y-%m-%d")
         return {
             "irr": 0.0,
+            "twr": 0.0,
             "total_invested": 0.0,
             "current_value": current_value,
             "profit_loss": 0.0,
@@ -84,6 +176,16 @@ def calculate_portfolio_stats(
     # 3. Calculate metrics
     irr = xirr(dates, amounts)
 
+    # 4. Calculate TWR if daily portfolio values provided
+    twr = 0.0
+    if daily_portfolio_values:
+        twr = calculate_twr(
+            daily_portfolio_values.get("daily_dates", []),
+            daily_portfolio_values.get("daily_values", []),
+            cash_flow_events,
+            current_date,
+        )
+
     # Simple P&L = Current Value + Withdrawals - Deposits
     profit_loss = current_value + total_withdrawn - total_invested
 
@@ -96,6 +198,7 @@ def calculate_portfolio_stats(
 
     return {
         "irr": irr,
+        "twr": twr,
         "total_invested": total_invested,
         "total_withdrawn": total_withdrawn,
         "current_value": current_value,
