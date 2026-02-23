@@ -69,6 +69,14 @@ def verify_credentials():
 
 
 @app.get("/", response_class=HTMLResponse)
+async def dashboard_page(
+    request: Request, auth: HTTPBasicCredentials = Depends(verify_credentials)
+):
+    """Render the dashboard page."""
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/upload/", response_class=HTMLResponse)
 async def upload_page(
     request: Request, auth: HTTPBasicCredentials = Depends(verify_credentials)
 ):
